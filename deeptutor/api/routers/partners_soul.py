@@ -6,9 +6,9 @@ version history discoverable and grouped with the partner they describe.
 All mutating endpoints require ``require_admin`` — editing a partner's
 soul is a production change, not a casual user action.
 
-Also provides :func:`snapshot_before_write` which the caller hooks into
-any SOUL edit so every change is captured automatically before the disk
-write happens.
+Every version record stores both ``user_id`` (machine-safe opaque id) and
+``username`` (human-readable display name) so audit logs show exactly who
+made each change, even if the id format evolves over time.
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ from deeptutor.services.soul import (
     record_publish,
     read_snapshot,
     rollback_to,
+    unified_diff,
 )
 
 logger = logging.getLogger(__name__)
@@ -45,10 +46,13 @@ def _partner_workspace(partner_id: str) -> Path:
     return soul_path(partner_id).parent
 
 
-def _actor() -> str:
-    """Who is calling this endpoint? Falls back to the local admin."""
-    user = get_current_user_or_none()
-    return (user or local_admin_user()).username or "local-admin"
+def _actor() -> tuple[str, str]:
+    """Return (user_id, username) of the current caller.
+
+    Falls back to the local admin when AUTH_ENABLED=false.
+    """
+    user = get_current_user_or_none() or local_admin_user()
+    return (user.id or "", user.username or "local-admin")
 
 
 # ── Schema ──────────────────────────────────────────────────────────────────
@@ -62,8 +66,23 @@ class RollbackRequest(BaseModel):
     note: str = Field(default="手动回滚", description="Optional note")
 
 
-class PublishRequest(BaseModel):
-    note: str = Field(default="", description="Optional publish note")
+class ChatEditRequest(BaseModel):
+    """Natural-language SOUL edit request — the core of the conversation editor.
+
+    ``instruction`` is a free-form Chinese sentence describing what to change.
+    The backend sends it to the LLM along with the current SOUL.md and gets
+    back a complete replacement SOUL.md.
+
+    When ``preview_only=true`` we generate + return the diff preview but do
+    NOT snapshot or write to disk — the caller reviews and confirms via
+    the regular ``/snapshot`` endpoint.
+
+    When ``preview_only=false`` we snapshot + write atomically (one-shot).
+    """
+
+    instruction: str = Field(..., min_length=1, description="自然语言修改意图，例如「把语气改活泼点」")
+    preview_only: bool = Field(default=True, description="True=只预览不落盘，False=直接写盘")
+    note: str = Field(default="", description="可选，覆盖自动生成的 note")
 
 
 # ── Read endpoints ─────────────────────────────────────────────────────────
@@ -110,7 +129,9 @@ def diff_partner_versions(
         "from": version_a,
         "to": version_b,
         "from_note": a_meta.note,
+        "from_username": a_meta.username,
         "to_note": b_meta.note,
+        "to_username": b_meta.username,
         "diff": patch,
         "empty": not bool(patch),
     }
@@ -137,6 +158,7 @@ def rollback_partner_soul(
 ) -> dict[str, Any]:
     from deeptutor.services.partners.workspace import read_soul, write_soul
 
+    actor_id, actor_name = _actor()
     ws = _partner_workspace(partner_id)
     target_content = read_snapshot(ws, version)
     if target_content is None:
@@ -146,23 +168,27 @@ def rollback_partner_soul(
     create_snapshot(
         ws,
         read_soul(partner_id) or "",
-        user_id=_actor(),
+        user_id=actor_id,
+        username=actor_name,
         action="update",
         note=f"回滚前快照 (即将回滚到 v{version})",
     )
 
-    # Actually write the old content back to SOUL.md.
     write_soul(partner_id, target_content)
 
-    # Record the rollback as a new version.
-    new_version = rollback_to(ws, version, user_id=_actor(), note=body.note or "手动回滚")
+    new_version = rollback_to(
+        ws, version,
+        user_id=actor_id, username=actor_name,
+        note=body.note or "手动回滚",
+    )
     if new_version is None:
         raise HTTPException(status_code=500, detail="Rollback failed")
 
     record_publish(
         ws,
         version=new_version.version,
-        user_id=_actor(),
+        user_id=actor_id,
+        username=actor_name,
         action="rollback",
         note=f"回滚到 v{version}",
     )
@@ -184,6 +210,7 @@ def snapshot_and_publish(partner_id: str, body: SoulWriteRequest) -> dict[str, A
     """
     from deeptutor.services.partners.workspace import read_soul, write_soul
 
+    actor_id, actor_name = _actor()
     ws = _partner_workspace(partner_id)
     old = read_soul(partner_id) or ""
     new = body.content
@@ -191,11 +218,9 @@ def snapshot_and_publish(partner_id: str, body: SoulWriteRequest) -> dict[str, A
     if old == new:
         raise HTTPException(status_code=400, detail="Content unchanged — nothing to snapshot")
 
-    # Snapshot the old state first so the diff is meaningful.
     create_snapshot(
-        ws,
-        old,
-        user_id=_actor(),
+        ws, old,
+        user_id=actor_id, username=actor_name,
         action="update",
         note="本次修改前的状态",
     )
@@ -203,9 +228,8 @@ def snapshot_and_publish(partner_id: str, body: SoulWriteRequest) -> dict[str, A
     write_soul(partner_id, new)
 
     version = create_snapshot(
-        ws,
-        new,
-        user_id=_actor(),
+        ws, new,
+        user_id=actor_id, username=actor_name,
         action="update",
         note=body.note,
     )
@@ -213,7 +237,8 @@ def snapshot_and_publish(partner_id: str, body: SoulWriteRequest) -> dict[str, A
     record_publish(
         ws,
         version=version.version,
-        user_id=_actor(),
+        user_id=actor_id,
+        username=actor_name,
         action="publish",
         note=body.note,
     )
@@ -222,6 +247,215 @@ def snapshot_and_publish(partner_id: str, body: SoulWriteRequest) -> dict[str, A
         "version": version.version,
         "meta": version.to_dict(),
     }
+
+
+@router.post("/souls/{partner_id}/chat-edit")
+async def chat_edit_soul(partner_id: str, body: ChatEditRequest) -> dict[str, Any]:
+    """对话式修改 SOUL.md — 用户说自然语言，LLM 生成新 SOUL，返回 diff 预览。
+
+    当 preview_only=true 时不写盘、不创建版本，只返回建议内容 + diff。
+    前端拿到 diff 高亮展示给用户确认，确认后再调 /snapshot 发布。
+    当 preview_only=false 时直接 snapshot + write + publish（同上一个接口）。
+    """
+    from deeptutor.services.partners.workspace import read_soul, write_soul
+
+    actor_id, actor_name = _actor()
+    ws = _partner_workspace(partner_id)
+
+    current = read_soul(partner_id) or ""
+
+    new_content, prompt_used = await _llm_generate_new_soul(partner_id, current, body.instruction)
+
+    if new_content == current:
+        raise HTTPException(
+            status_code=422,
+            detail="LLM 未对 SOUL.md 产生实际变更 — 请换一种更具体的修改说法",
+        )
+
+    auto_note = body.note or f"对话式修改：{body.instruction[:60]}"
+
+    patch = unified_diff(current, new_content, from_version=None, to_version=None)
+
+    if body.preview_only:
+        return {
+            "partner_id": partner_id,
+            "mode": "preview",
+            "preview_content": new_content,
+            "note": auto_note,
+            "diff": patch,
+            "prompt_used": prompt_used,
+            "empty": not bool(patch),
+        }
+
+    # ── Write path ──────────────────────────────────────────────────────
+    create_snapshot(
+        ws, current,
+        user_id=actor_id, username=actor_name,
+        action="update",
+        note="对话式修改前的状态",
+    )
+
+    write_soul(partner_id, new_content)
+
+    version = create_snapshot(
+        ws, new_content,
+        user_id=actor_id, username=actor_name,
+        action="update",
+        note=auto_note,
+    )
+
+    record_publish(
+        ws,
+        version=version.version,
+        user_id=actor_id, username=actor_name,
+        action="publish",
+        note=auto_note,
+    )
+    return {
+        "partner_id": partner_id,
+        "mode": "published",
+        "version": version.version,
+        "meta": version.to_dict(),
+        "note": auto_note,
+        "diff": patch,
+    }
+
+
+# ── LLM call for chat-edit ────────────────────────────────────────────────
+
+_SOUL_EDIT_SYSTEM_PROMPT = """你是 SOUL.md 编辑助手。你的唯一任务是根据用户的修改意图，
+输出修改后的完整 SOUL.md 内容。
+
+硬性规则：
+1. 只输出 SOUL.md 的 markdown 正文，不要任何解释、前言、代码块标记（```）或尾部注释
+2. 保持原有的 markdown 结构（标题层级、列表、加粗等），只改被要求改的部分
+3. 如果修改意图不明确，保持原样
+4. 保留所有没被要求修改的段落——不要自作主张重写整个文件
+
+直接输出 SOUL.md 全文即可。"""
+
+
+async def _llm_generate_new_soul(
+    partner_id: str,
+    current_content: str,
+    instruction: str,
+) -> tuple[str, str]:
+    """Call the configured LLM to generate a new SOUL.md from + instruction.
+
+    Returns (new_content, prompt_used_for_debug).
+    Falls back to a deterministic rule-based transformer when no LLM is
+    configured (so this endpoint is always functional during local dev).
+    """
+    # Lazy import — LLM wiring is deep and optional.
+    try:
+        from deeptutor.services.partners.model_runtime import resolve_partner_llm_config
+        cfg = resolve_partner_llm_config(partner_id)
+        provider_name = (cfg.provider or "").strip()
+        model_name = (cfg.model or "").strip()
+
+        if provider_name and model_name:
+            new_content = await _call_llm(
+                provider_name=provider_name,
+                model_name=model_name,
+                current_soul=current_content,
+                instruction=instruction,
+            )
+            if new_content and new_content.strip():
+                return new_content.strip(), f"{provider_name}/{model_name}"
+    except Exception:
+        logger.exception("LLM path failed for SOUL chat-edit — falling back to rule-based")
+
+    # ── Fallback: rule-based transformer ─────────────────────────────────
+    return _rule_based_edit(current_content, instruction), "fallback:rule-based"
+
+
+async def _call_llm(
+    *,
+    provider_name: str,
+    model_name: str,
+    current_soul: str,
+    instruction: str,
+) -> str:
+    """Low-level LLM chat call — thin wrapper over provider registry."""
+    from deeptutor.services.provider_registry import find_by_name
+
+    spec = find_by_name(provider_name)
+    if spec is None:
+        raise RuntimeError(f"Provider '{provider_name}' not registered")
+
+    # Build messages payload
+    user_prompt = (
+        f"# 当前 SOUL.md\n\n```markdown\n{current_soul}\n```\n\n"
+        f"# 修改意图\n\n{instruction}\n\n"
+        f"# 输出要求\n\n直接输出修改后的 SOUL.md 全文，不要任何其他文字。"
+    )
+
+    # Different providers expose different client shapes; dispatch by name.
+    if "openai" in provider_name.lower() or "doubao" in provider_name.lower() or "ark" in provider_name.lower():
+        return await _call_openai_compatible(
+            spec.base_url or "",
+            spec.api_key or "",
+            model_name,
+            user_prompt,
+        )
+    if "qwen" in provider_name.lower() or "dashscope" in provider_name.lower():
+        return await _call_openai_compatible(
+            spec.base_url or "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            spec.api_key or "",
+            model_name,
+            user_prompt,
+        )
+
+    # Generic OpenAI-compatible last resort
+    return await _call_openai_compatible(
+        spec.base_url or "",
+        spec.api_key or "",
+        model_name,
+        user_prompt,
+    )
+
+
+async def _call_openai_compatible(
+    base_url: str,
+    api_key: str,
+    model: str,
+    user_prompt: str,
+) -> str:
+    """Call any OpenAI-compatible /chat/completions endpoint via httpx."""
+    import httpx
+
+    url = base_url.rstrip("/") + "/chat/completions"
+    payload = {
+        "model": model,
+        "temperature": 0.3,
+        "messages": [
+            {"role": "system", "content": _SOUL_EDIT_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+        r = await client.post(url, json=payload, headers=headers)
+        r.raise_for_status()
+        data = r.json()
+    return data["choices"][0]["message"]["content"]
+
+
+def _rule_based_edit(current: str, instruction: str) -> str:
+    """Deterministic fallback when no LLM is configured.
+
+    Not smart at all — it just tries a couple of common edits (prepend /
+    append a remark). This keeps the endpoint functional locally so the
+    UI can be developed against it even without an API key.
+    """
+    needle = instruction.strip()
+    remark = f"\n\n> 💡 自动修改标记：{needle}\n"
+    if remark in current:
+        return current  # already applied
+    return current.rstrip() + remark
 
 
 # ── Hook helper ────────────────────────────────────────────────────────────
@@ -237,14 +471,14 @@ def snapshot_before_write(partner_id: str, new_content: str, *, note: str = "") 
     """
     from deeptutor.services.partners.workspace import read_soul
 
+    actor_id, actor_name = _actor()
     ws = _partner_workspace(partner_id)
     old = read_soul(partner_id) or ""
     if old == new_content:
         return
     create_snapshot(
-        ws,
-        new_content,
-        user_id=_actor(),
+        ws, new_content,
+        user_id=actor_id, username=actor_name,
         action="update",
         note=note or "unsaved edit",
     )

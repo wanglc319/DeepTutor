@@ -57,11 +57,12 @@ class SoulVersion:
 
     version: int
     timestamp: str
-    user_id: str
-    action: str  # create | update | rollback | publish
-    note: str
-    content_hash: str
-    previous_version: int | None
+    user_id: str = ""
+    username: str = ""
+    action: str = ""  # create | update | rollback | publish
+    note: str = ""
+    content_hash: str = ""
+    previous_version: int | None = None
     diff_from_previous: str = ""
     path: str = ""  # relative path of the snapshot file
 
@@ -75,9 +76,10 @@ class PublishEvent:
 
     version: int
     timestamp: str
-    user_id: str
-    action: str  # publish | rollback | revert
-    note: str
+    user_id: str = ""
+    username: str = ""
+    action: str = ""  # publish | rollback | revert
+    note: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -204,6 +206,7 @@ def create_snapshot(
     content: str,
     *,
     user_id: str = "system",
+    username: str = "",
     action: str = "update",
     note: str = "",
     previous_version: int | None = None,
@@ -238,6 +241,7 @@ def create_snapshot(
         version=next_version,
         timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         user_id=user_id,
+        username=username,
         action=action,
         note=note,
         content_hash=content_hash,
@@ -254,6 +258,7 @@ def rollback_to(
     version: int,
     *,
     user_id: str = "system",
+    username: str = "",
     note: str = "手动回滚",
 ) -> SoulVersion | None:
     """Snapshot the content at ``version`` as a new rollback version.
@@ -268,6 +273,7 @@ def rollback_to(
         partner_workspace,
         content,
         user_id=user_id,
+        username=username,
         action="rollback",
         note=f"{note} → v{version}",
     )
@@ -278,6 +284,7 @@ def record_publish(
     version: int,
     *,
     user_id: str = "system",
+    username: str = "",
     action: str = "publish",
     note: str = "",
 ) -> PublishEvent:
@@ -285,6 +292,7 @@ def record_publish(
         version=version,
         timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         user_id=user_id,
+        username=username,
         action=action,
         note=note,
     )
