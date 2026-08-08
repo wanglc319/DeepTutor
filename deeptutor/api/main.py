@@ -349,6 +349,8 @@ from deeptutor.api.routers import (
     memory,
     notebook,
     partners,
+    partners_soul,
+    partners_v2,
     personas,
     plugins_api,
     question,
@@ -485,6 +487,16 @@ app.include_router(
 )
 app.include_router(
     partners.router, prefix="/api/v1/partners", tags=["partners"], dependencies=_admin
+)
+app.include_router(
+    partners_soul.router,
+    prefix="/api/v1/partners",
+    tags=["partners-soul"],
+)
+app.include_router(
+    partners_v2.router,
+    prefix="/api/v2",
+    tags=["partners-v2"],
 )
 app.include_router(
     attachments.router,
