@@ -74,6 +74,13 @@ LIGHTRAG_SERVER_KB_TYPE = "lightrag_server"
 # ``search_knowledge`` OpenAPI by the ``ima`` provider.
 IMA_KB_TYPE = "ima"
 
+# A connected external Qdrant collection: a pointer (``host`` + ``port`` +
+# ``collection_name``) to a Qdrant index the user curates externally (typically
+# Dify). No path on disk and no local index — the ``qdrant`` provider generates
+# query embeddings with DeepTutor's active embedding client and hits Qdrant's
+# search API. Dify (or another writer) owns indexing and document ingestion.
+QDRANT_KB_TYPE = "qdrant"
+
 # Every pointer/connected KB type. Membership here is what makes the manager
 # skip the index pipeline, the orphan prune and the embedding reconcile.
 CONNECTED_KB_TYPES = frozenset(
@@ -83,6 +90,7 @@ CONNECTED_KB_TYPES = frozenset(
         SUBAGENT_KB_TYPE,
         LIGHTRAG_SERVER_KB_TYPE,
         IMA_KB_TYPE,
+        QDRANT_KB_TYPE,
     }
 )
 
@@ -109,6 +117,7 @@ __all__ = [
     "SUBAGENT_KB_TYPE",
     "LIGHTRAG_SERVER_KB_TYPE",
     "IMA_KB_TYPE",
+    "QDRANT_KB_TYPE",
     "CONNECTED_KB_TYPES",
     "is_connected_kb",
     "external_root_of",

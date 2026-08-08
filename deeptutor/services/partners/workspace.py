@@ -162,10 +162,28 @@ def _err(exc: Exception) -> str:
 
 
 def _copy_knowledge_base(kb_ref: str, partner_root: Path) -> str:
+    from deeptutor.knowledge.kb_types import CONNECTED_KB_TYPES
     from deeptutor.multi_user.knowledge_access import resolve_kb
 
     resource = resolve_kb(kb_ref)
     src = Path(resource.base_dir) / resource.name
+
+    entry = _lookup_kb_entry(resource.name)
+    entry_type = (entry or {}).get("type", "")
+
+    if entry_type in CONNECTED_KB_TYPES:
+        dst = partner_root / "knowledge_bases" / resource.name
+        dst.mkdir(parents=True, exist_ok=True)
+        marker = dst / "_connected.json"
+        if not marker.exists():
+            import json as _json
+
+            marker.write_text(
+                _json.dumps({"name": resource.name, "type": entry_type, "connected": True}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        return resource.name
+
     if not src.is_dir():
         raise FileNotFoundError(f"Knowledge base directory missing: {resource.name}")
     dst = partner_root / "knowledge_bases" / resource.name
@@ -173,6 +191,22 @@ def _copy_knowledge_base(kb_ref: str, partner_root: Path) -> str:
         return resource.name  # already provisioned
     shutil.copytree(src, dst)
     return resource.name
+
+
+def _lookup_kb_entry(kb_name: str) -> dict | None:
+    try:
+        from deeptutor.runtime.home import get_runtime_data_root
+
+        cfg_path = get_runtime_data_root() / "knowledge_bases" / "kb_config.json"
+        if not cfg_path.is_file():
+            return None
+        import json as _json
+
+        cfg = _json.loads(cfg_path.read_text(encoding="utf-8"))
+        return cfg.get("knowledge_bases", {}).get(kb_name)
+    except Exception:
+        logger.debug("Failed to look up KB entry for %s", kb_name, exc_info=True)
+        return None
 
 
 def _skill_source_dir(skill_name: str) -> Path:

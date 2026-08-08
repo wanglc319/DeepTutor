@@ -22,6 +22,7 @@ from deeptutor.knowledge.kb_types import (
     LIGHTRAG_SERVER_KB_TYPE,
     LINKED_KB_TYPE,
     OBSIDIAN_KB_TYPE,
+    QDRANT_KB_TYPE,
     SUBAGENT_KB_TYPE,
     external_root_of,
     is_connected_kb,
@@ -33,6 +34,7 @@ from deeptutor.services.rag.factory import (
     IMA_PROVIDER,
     KNOWN_PROVIDERS,
     LIGHTRAG_SERVER_PROVIDER,
+    QDRANT_PROVIDER,
     has_ready_provider_index,
     normalize_provider_name,
     provider_uses_embedding_versions,
@@ -923,6 +925,63 @@ class KnowledgeBaseManager:
             "api_key": api_key,
             "knowledge_base_id": knowledge_base_id,
             "description": description or f"Tencent IMA: {name}",
+            "status": "ready",
+            "needs_reindex": False,
+            "created_at": now,
+            "updated_at": now,
+        }
+        knowledge_bases[name] = entry
+        self._save_config()
+        return entry
+
+    def register_qdrant_kb(
+        self,
+        name: str,
+        host: str,
+        port: int,
+        collection_name: str,
+        *,
+        vector_name: str = "",
+        description: str = "",
+    ) -> dict:
+        """Register a pointer to an external Qdrant collection as a connected KB.
+
+        Like the other connected types this creates no folder under ``base_dir``
+        and runs no index pipeline: it records a ``type: qdrant`` entry whose
+        (host, port, collection_name) the ``qdrant`` provider queries with its
+        own generated query embeddings. An external writer (typically Dify) owns
+        indexing and document ingestion entirely. Raises ``ValueError`` on a
+        missing field or a name clash.
+        """
+        name = (name or "").strip()
+        host = (host or "").strip()
+        collection_name = (collection_name or "").strip()
+        if not name:
+            raise ValueError("Knowledge base name is required.")
+        if not host:
+            raise ValueError("Qdrant host is required.")
+        if not collection_name:
+            raise ValueError("Qdrant collection name is required.")
+        try:
+            port = int(port)
+        except (TypeError, ValueError):
+            raise ValueError(f"Invalid Qdrant port: {port!r}")
+
+        self.config = self._load_config()
+        knowledge_bases = self.config.setdefault("knowledge_bases", {})
+        if name in knowledge_bases:
+            raise ValueError(f"A knowledge base named '{name}' already exists.")
+
+        now = datetime.now().isoformat()
+        entry: dict[str, Any] = {
+            "path": name,
+            "type": QDRANT_KB_TYPE,
+            "rag_provider": QDRANT_PROVIDER,
+            "host": host,
+            "port": port,
+            "collection_name": collection_name,
+            "vector_name": (vector_name or "").strip(),
+            "description": description or f"Qdrant: {name}",
             "status": "ready",
             "needs_reindex": False,
             "created_at": now,

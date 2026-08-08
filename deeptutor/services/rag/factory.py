@@ -33,6 +33,7 @@ GRAPHRAG_PROVIDER = "graphrag"
 LIGHTRAG_PROVIDER = "lightrag"
 LIGHTRAG_SERVER_PROVIDER = "lightrag-server"
 IMA_PROVIDER = "ima"
+QDRANT_PROVIDER = "qdrant"
 
 # Providers the factory can instantiate. Unknown / legacy strings fall back to
 # the default with a re-index hint upstream.
@@ -44,6 +45,7 @@ KNOWN_PROVIDERS = frozenset(
         LIGHTRAG_PROVIDER,
         LIGHTRAG_SERVER_PROVIDER,
         IMA_PROVIDER,
+        QDRANT_PROVIDER,
     }
 )
 
@@ -152,6 +154,13 @@ def _build_pipeline(provider: str, kb_base_dir: Optional[str], **kwargs: Any):
         if kb_base_dir is not None:
             kwargs.setdefault("kb_base_dir", kb_base_dir)
         return ImaPipeline(**kwargs)
+
+    if provider == QDRANT_PROVIDER:
+        from .pipelines.qdrant.pipeline import QdrantPipeline
+
+        if kb_base_dir is not None:
+            kwargs.setdefault("kb_base_dir", kb_base_dir)
+        return QdrantPipeline(**kwargs)
 
     from .pipelines.llamaindex.pipeline import LlamaIndexPipeline
 
@@ -272,6 +281,18 @@ def list_pipelines() -> List[Dict[str, Any]]:
             "configured": True,
             "requires_api_key": False,
         },
+        {
+            "id": QDRANT_PROVIDER,
+            "name": "Qdrant",
+            "description": (
+                "Retrieval offloaded to an external Qdrant collection (e.g. managed "
+                "by Dify). No local index — connect a KB to the collection name and "
+                "query with DeepTutor's active embedding model. Documents are added "
+                "in Dify or any external writer."
+            ),
+            "configured": True,
+            "requires_api_key": False,
+        },
     ]
 
 
@@ -282,6 +303,7 @@ __all__ = [
     "LIGHTRAG_PROVIDER",
     "LIGHTRAG_SERVER_PROVIDER",
     "IMA_PROVIDER",
+    "QDRANT_PROVIDER",
     "KNOWN_PROVIDERS",
     "get_pipeline",
     "has_ready_provider_index",
