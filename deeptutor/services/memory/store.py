@@ -1,9 +1,13 @@
 """High-level facade for the three-layer memory subsystem.
 
 All callers — API routers, LLM tools, surface event hooks — go through
-:class:`MemoryStore`. The store is stateless; per-user isolation is
-inherited from :func:`paths.memory_root` which resolves :class:`PathService`
-lazily via context variables.
+:class:`MemoryStore`. The store is thin: every I/O operation now flows
+through :class:`~deeptutor.services.memory.backend.MemoryBackend`, making
+it trivial to swap the persistence layer (filesystem → SQLite → PostgreSQL)
+without touching any caller above this module.
+
+Per-user isolation is inherited from the backend instance which is bound to
+a single user namespace at construction time.
 """
 
 from __future__ import annotations
@@ -16,7 +20,8 @@ from pathlib import Path
 import shutil
 from typing import Literal
 
-from deeptutor.services.memory import consolidator, paths, trace
+from deeptutor.services.memory import consolidator, paths
+from deeptutor.services.memory.backend import FileBackend, MemoryBackend
 from deeptutor.services.memory.consolidator import ConsolidateResult, OnEvent
 from deeptutor.services.memory.document import Document, parse, serialize
 from deeptutor.services.memory.ops import AddOp, ApplyReport, EditOp, OpResult
@@ -65,36 +70,65 @@ class DocOverview:
     backlog: int  # L1 events since last update (L2 only; 0 for L3)
 
 
-class MemoryStore:
-    """Stateless facade. Safe to call as a process-wide singleton."""
+def _default_title(layer: Layer, key: str) -> str:
+    if layer == "L2":
+        return f"{key} memory"
+    return {
+        "recent": "Recent summary",
+        "profile": "User profile",
+        "scope": "Knowledge scope",
+        "preferences": "Preferences",
+    }.get(key, key)
 
-    def __init__(self) -> None:
-        self._write_locks: dict[str, asyncio.Lock] = {}
+
+class MemoryStore:
+    """Facade that delegates all storage to a :class:`MemoryBackend`.
+
+    Defaults to :class:`FileBackend` so existing installs keep working with
+    no config change. Other backends (SQLite, PostgreSQL) are wired in
+    later through :func:`get_memory_store`.
+    """
+
+    def __init__(self, backend: MemoryBackend | None = None) -> None:
+        self._backend: MemoryBackend = backend or FileBackend()
 
     # ── L1 ────────────────────────────────────────────────────────────────
 
     async def emit(self, event: TraceEvent) -> None:
-        await trace.append(event)
+        """Write one trace event to L1. Never raises."""
+        import json
+        from dataclasses import asdict
+
+        try:
+            line = json.dumps(
+                asdict(event), ensure_ascii=False, separators=(",", ":")
+            )
+            day_iso = datetime.now(tz=timezone.utc).date().isoformat()
+            await self._backend.append_trace(event.surface, day_iso, line)
+        except Exception:
+            logger.warning(
+                "memory trace append failed surface=%s kind=%s",
+                event.surface,
+                event.kind,
+                exc_info=True,
+            )
 
     # ── L2 / L3 read ──────────────────────────────────────────────────────
 
     def read_doc(self, layer: Layer, key: str) -> Document:
-        path = self._path(layer, key)
-        if not path.exists():
+        md = self._backend.read_doc_text(layer, key)
+        if not md:
             return Document(title=_default_title(layer, key))
-        return parse(path.read_text(encoding="utf-8"))
+        return parse(md)
 
     def read_raw(self, layer: Layer, key: str) -> str:
-        path = self._path(layer, key)
-        if not path.exists():
-            return ""
-        return path.read_text(encoding="utf-8")
+        return self._backend.read_doc_text(layer, key)
 
     def read_l3_concat(self) -> str:
         """Concatenate all four L3 docs for the ``read_memory`` tool."""
         parts: list[str] = []
         for slot in paths.L3_SLOTS:
-            body = self.read_raw("L3", slot).strip()
+            body = self._backend.read_doc_text("L3", slot).strip()
             if body:
                 parts.append(body)
         if not parts:
@@ -105,19 +139,18 @@ class MemoryStore:
 
     async def overwrite_doc(self, layer: Layer, key: str, md: str) -> None:
         """Direct user-driven save from the workbench editor."""
-        path = self._path(layer, key)
-        async with self._lock_for(path):
-            await asyncio.to_thread(_atomic_write, path, md)
+        async with self._backend.lock(f"{layer}/{key}"):
+            await self._backend.write_doc_text(layer, key, md)
 
     async def delete_entry(self, layer: Layer, key: str, entry_id: str) -> bool:
-        path = self._path(layer, key)
-        if not path.exists():
+        if not self._backend.doc_exists(layer, key):
             return False
-        async with self._lock_for(path):
-            doc = parse(path.read_text(encoding="utf-8"))
+        async with self._backend.lock(f"{layer}/{key}"):
+            md = self._backend.read_doc_text(layer, key)
+            doc = parse(md)
             if not doc.remove(entry_id):
                 return False
-            await asyncio.to_thread(_atomic_write, path, serialize(doc))
+            await self._backend.write_doc_text(layer, key, serialize(doc))
             return True
 
     # ── L2 / L3 write (consolidator paths) ────────────────────────────────
@@ -131,8 +164,7 @@ class MemoryStore:
         on_event: OnEvent | None = None,
         apply_ops: bool = True,
     ) -> ConsolidateResult:
-        path = paths.l2_file(surface)
-        async with self._lock_for(path):
+        async with self._backend.lock(f"L2/{surface}"):
             return await consolidator.consolidate_l2(
                 surface,
                 language=language,
@@ -152,8 +184,7 @@ class MemoryStore:
     ) -> ConsolidateResult:
         if slot == "preferences":
             raise ValueError("preferences.md is not auto-consolidated")
-        path = paths.l3_file(slot)
-        async with self._lock_for(path):
+        async with self._backend.lock(f"L3/{slot}"):
             return await consolidator.consolidate_l3(
                 slot,
                 language=language,
@@ -173,22 +204,18 @@ class MemoryStore:
         """
         from deeptutor.services.memory.consolidator import _parse_ops_response
 
-        path = self._path(layer, key)
-        json_like = {"ops": ops_payload}
         import json as _json
 
-        ops = _parse_ops_response(_json.dumps(json_like, ensure_ascii=False))
-        async with self._lock_for(path):
+        ops = _parse_ops_response(
+            _json.dumps({"ops": ops_payload}, ensure_ascii=False)
+        )
+        async with self._backend.lock(f"{layer}/{key}"):
             default_title = _default_title(layer, key)
-            doc = (
-                parse(path.read_text(encoding="utf-8"))
-                if path.exists()
-                else Document(title=default_title)
-            )
+            md = self._backend.read_doc_text(layer, key)
+            doc = parse(md) if md else Document(title=default_title)
             report = ops_apply(doc, ops)
             if report.accepted and ops:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                await asyncio.to_thread(_atomic_write, path, serialize(doc))
+                await self._backend.write_doc_text(layer, key, serialize(doc))
             return report
 
     async def write_preference(
@@ -203,29 +230,24 @@ class MemoryStore:
         """Write the chat-mode preference signal. The ``write_memory`` tool
         is the only caller; ``trace_id`` is the current chat turn's L1 id
         injected by runtime."""
-        path = paths.l3_file("preferences")
-        async with self._lock_for(path):
+        async with self._backend.lock("L3/preferences"):
+            md = self._backend.read_doc_text("L3", "preferences")
             doc = (
-                parse(path.read_text(encoding="utf-8"))
-                if path.exists()
+                parse(md)
+                if md
                 else Document(title=_default_title("L3", "preferences"))
             )
             section = "Preferences"
             if op == "add":
-                # Idempotent add: preferences.md is never auto-consolidated
-                # (see update_l3), so an identical bullet added again would
-                # persist forever as a duplicate. Guided-learning turns are
-                # highly tool-driven and long-running, so the model tends to
-                # re-issue the same write_memory across turns (issue #647).
-                # Short-circuit to a no-op that reports the existing entry as
-                # already saved instead of appending a duplicate.
                 duplicate = _find_duplicate_preference(doc, section, text)
                 if duplicate is not None:
                     return ApplyReport(
                         accepted=True,
                         results=[
                             OpResult(
-                                op=AddOp(section=section, text=text, refs=[trace_id]),
+                                op=AddOp(
+                                    section=section, text=text, refs=[trace_id]
+                                ),
                                 status="applied",
                                 entry_id=duplicate.id,
                                 detail="duplicate",
@@ -238,7 +260,9 @@ class MemoryStore:
                 )
             else:
                 if not target_id:
-                    return ApplyReport(accepted=False, reason="edit requires target_id")
+                    return ApplyReport(
+                        accepted=False, reason="edit requires target_id"
+                    )
                 report = ops_apply(
                     doc,
                     [
@@ -250,10 +274,13 @@ class MemoryStore:
                     ],
                 )
             if report.accepted:
-                await asyncio.to_thread(_atomic_write, path, serialize(doc))
+                await self._backend.write_doc_text(
+                    "L3", "preferences", serialize(doc)
+                )
             if reason:
-                # Surface the reason in logs for workbench observability.
-                logger.info("write_memory %s id=%s reason=%s", op, target_id or "new", reason)
+                logger.info(
+                    "write_memory %s id=%s reason=%s", op, target_id or "new", reason
+                )
             return report
 
     # ── Workbench overview ────────────────────────────────────────────────
@@ -267,9 +294,13 @@ class MemoryStore:
         return rows
 
     def _overview_for(self, layer: Layer, key: str) -> DocOverview:
-        path = self._path(layer, key)
-        if not path.exists():
-            backlog = trace.count_since(key) if layer == "L2" else 0  # type: ignore[arg-type]
+        exists = self._backend.doc_exists(layer, key)
+        if not exists:
+            backlog = (
+                self._backend.count_trace(key)  # type: ignore[arg-type]
+                if layer == "L2"
+                else 0
+            )
             return DocOverview(
                 layer=layer,
                 key=key,
@@ -279,19 +310,22 @@ class MemoryStore:
                 backlog=backlog,
             )
 
-        stat = path.stat()
-        updated_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
+        mtime = self._backend.doc_mtime(layer, key)
+        updated_at_iso = mtime.isoformat() if mtime else None
+
+        md = self._backend.read_doc_text(layer, key)
         try:
-            doc = parse(path.read_text(encoding="utf-8"))
+            doc = parse(md) if md else Document(title=_default_title(layer, key))
             entry_count = len(doc.all_entries())
         except Exception:
             entry_count = 0
 
         backlog = 0
-        if layer == "L2":
+        if layer == "L2" and mtime is not None:
             try:
-                cutoff = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
-                backlog = trace.count_since(key, since=cutoff)  # type: ignore[arg-type]
+                backlog = self._backend.count_trace(
+                    key, since=mtime  # type: ignore[arg-type]
+                )
             except Exception:
                 backlog = 0
 
@@ -299,29 +333,16 @@ class MemoryStore:
             layer=layer,
             key=key,
             exists=True,
-            updated_at=updated_at,
+            updated_at=updated_at_iso,
             entry_count=entry_count,
             backlog=backlog,
         )
 
-    # ── Internals ─────────────────────────────────────────────────────────
+    # ── Introspection ──────────────────────────────────────────────────────
 
-    def _path(self, layer: Layer, key: str) -> Path:
-        if layer == "L2":
-            if key not in paths.SURFACES:
-                raise ValueError(f"unknown surface {key!r}")
-            return paths.l2_file(key)  # type: ignore[arg-type]
-        if key not in paths.L3_SLOTS:
-            raise ValueError(f"unknown L3 slot {key!r}")
-        return paths.l3_file(key)  # type: ignore[arg-type]
-
-    def _lock_for(self, path: Path) -> asyncio.Lock:
-        key = str(path)
-        lock = self._write_locks.get(key)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._write_locks[key] = lock
-        return lock
+    @property
+    def backend(self) -> MemoryBackend:
+        return self._backend
 
 
 # ── v1 → v2 startup migration ─────────────────────────────────────────────
@@ -431,29 +452,20 @@ def migrate_partner_surface_if_needed() -> bool:
 _singleton: MemoryStore | None = None
 
 
-def get_memory_store() -> MemoryStore:
+def get_memory_store(backend: MemoryBackend | None = None) -> MemoryStore:
+    """Return the process-wide :class:`MemoryStore` singleton.
+
+    Passing ``backend`` on the first call wires a custom backend (used for
+    testing and future Phase-2/3 rollouts). Subsequent calls return the
+    existing singleton — the backend argument is ignored.
+    """
     global _singleton
     if _singleton is None:
-        _singleton = MemoryStore()
+        _singleton = MemoryStore(backend)
     return _singleton
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────
-
-
-def _default_title(layer: Layer, key: str) -> str:
-    if layer == "L2":
-        return f"{key} memory"
-    return {
-        "recent": "Recent summary",
-        "profile": "User profile",
-        "scope": "Knowledge scope",
-        "preferences": "Preferences",
-    }.get(key, key)
-
-
-def _atomic_write(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(content, encoding="utf-8")
-    tmp.replace(path)
+def reset_memory_store_for_testing() -> None:
+    """Reset the singleton. Tests call this in ``setUp``/``tearDown``."""
+    global _singleton
+    _singleton = None
