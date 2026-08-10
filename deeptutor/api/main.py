@@ -365,6 +365,7 @@ from deeptutor.api.routers import (
     system,
     unified_ws,
     voice,
+    ws_v2,
 )
 from deeptutor.api.routers import (
     tools as tools_router,
@@ -508,6 +509,9 @@ app.include_router(
 # Unified WebSocket endpoint — auth is checked inside the handler (WebSockets
 # cannot use FastAPI dependencies in the standard way)
 app.include_router(unified_ws.router, prefix="/api/v1", tags=["unified-ws"])
+
+# v2 typing-style WebSocket — simulates real bot "one sentence at a time" UX
+app.include_router(ws_v2.router, prefix="/api/v2/ws", tags=["ws-v2"])
 
 # Quiz AI-judge WebSocket — same caveat as unified_ws above; auth is checked
 # inside the handler so the WS upgrade isn't rejected by an HTTP-style dep.

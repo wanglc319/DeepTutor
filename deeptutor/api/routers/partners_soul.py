@@ -86,6 +86,16 @@ class ChatEditRequest(BaseModel):
 
 
 # ── Read endpoints ─────────────────────────────────────────────────────────
+#
+# Important: this module mounts under /api/v1/partners. The path
+# /souls/{partner_id} is ALREADY claimed by partners.py's SOUL-template
+# management (GET /souls/{soul_id} — unrelated to workspace SOUL.md).
+# We therefore deliberately DO NOT redefine it here. Callers that want the
+# live SOUL.md content must hit the *singular* partner-workspace endpoint:
+#
+#     GET  /api/v1/partners/{partner_id}/soul   ← partners.py, returns current SOUL.md
+#
+# All the version-history endpoints below use the /souls/ plural.
 
 @router.get("/souls/{partner_id}/versions")
 def list_partner_versions(partner_id: str) -> dict[str, Any]:
@@ -95,6 +105,19 @@ def list_partner_versions(partner_id: str) -> dict[str, Any]:
         "partner_id": partner_id,
         "version_count": len(versions),
         "versions": [v.to_dict() for v in versions],
+    }
+
+
+@router.get("/souls/{partner_id}/versions/publish")
+def list_publish_history(partner_id: str) -> dict[str, Any]:
+    """Publish audit log — MUST come before /versions/{version} or FastAPI
+    tries to parse 'publish' as an integer version number (422)."""
+    ws = _partner_workspace(partner_id)
+    events = list_publish_events(ws)
+    return {
+        "partner_id": partner_id,
+        "event_count": len(events),
+        "events": [e.to_dict() for e in events],
     }
 
 
@@ -134,17 +157,6 @@ def diff_partner_versions(
         "to_username": b_meta.username,
         "diff": patch,
         "empty": not bool(patch),
-    }
-
-
-@router.get("/souls/{partner_id}/versions/publish")
-def list_publish_history(partner_id: str) -> dict[str, Any]:
-    ws = _partner_workspace(partner_id)
-    events = list_publish_events(ws)
-    return {
-        "partner_id": partner_id,
-        "event_count": len(events),
-        "events": [e.to_dict() for e in events],
     }
 
 
@@ -342,87 +354,66 @@ async def _llm_generate_new_soul(
 ) -> tuple[str, str]:
     """Call the configured LLM to generate a new SOUL.md from + instruction.
 
-    Returns (new_content, prompt_used_for_debug).
-    Falls back to a deterministic rule-based transformer when no LLM is
-    configured (so this endpoint is always functional during local dev).
+    Returns (new_content, label). Falls back to rule-based when the system
+    LLM config is missing or the call errors out — but the rule-based path
+    is now a real keyword/number substitution engine, not a dumb append.
     """
-    # Lazy import — LLM wiring is deep and optional.
     try:
         from deeptutor.services.partners.model_runtime import resolve_partner_llm_config
         cfg = resolve_partner_llm_config(partner_id)
-        provider_name = (cfg.provider or "").strip()
-        model_name = (cfg.model or "").strip()
 
-        if provider_name and model_name:
-            new_content = await _call_llm(
-                provider_name=provider_name,
-                model_name=model_name,
+        model_name = (cfg.model or "").strip()
+        base_url = (cfg.base_url or "").strip()
+        api_key = (cfg.api_key or "").strip()
+
+        if model_name and base_url and api_key:
+            new_content = await _call_openai_compatible(
+                base_url=base_url,
+                api_key=api_key,
+                model=model_name,
                 current_soul=current_content,
                 instruction=instruction,
             )
             if new_content and new_content.strip():
-                return new_content.strip(), f"{provider_name}/{model_name}"
+                return new_content.strip(), f"llm:{cfg.provider_name}/{model_name}"
+            logger.warning("LLM returned empty content for SOUL edit")
+        else:
+            logger.warning(
+                "LLM config incomplete for SOUL edit: model=%r base_url=%r key=%s",
+                model_name, base_url, "set" if api_key else "missing",
+            )
     except Exception:
         logger.exception("LLM path failed for SOUL chat-edit — falling back to rule-based")
 
-    # ── Fallback: rule-based transformer ─────────────────────────────────
-    return _rule_based_edit(current_content, instruction), "fallback:rule-based"
-
-
-async def _call_llm(
-    *,
-    provider_name: str,
-    model_name: str,
-    current_soul: str,
-    instruction: str,
-) -> str:
-    """Low-level LLM chat call — thin wrapper over provider registry."""
-    from deeptutor.services.provider_registry import find_by_name
-
-    spec = find_by_name(provider_name)
-    if spec is None:
-        raise RuntimeError(f"Provider '{provider_name}' not registered")
-
-    # Build messages payload
-    user_prompt = (
-        f"# 当前 SOUL.md\n\n```markdown\n{current_soul}\n```\n\n"
-        f"# 修改意图\n\n{instruction}\n\n"
-        f"# 输出要求\n\n直接输出修改后的 SOUL.md 全文，不要任何其他文字。"
-    )
-
-    # Different providers expose different client shapes; dispatch by name.
-    if "openai" in provider_name.lower() or "doubao" in provider_name.lower() or "ark" in provider_name.lower():
-        return await _call_openai_compatible(
-            spec.base_url or "",
-            spec.api_key or "",
-            model_name,
-            user_prompt,
-        )
-    if "qwen" in provider_name.lower() or "dashscope" in provider_name.lower():
-        return await _call_openai_compatible(
-            spec.base_url or "https://dashscope.aliyuncs.com/compatible-mode/v1",
-            spec.api_key or "",
-            model_name,
-            user_prompt,
-        )
-
-    # Generic OpenAI-compatible last resort
-    return await _call_openai_compatible(
-        spec.base_url or "",
-        spec.api_key or "",
-        model_name,
-        user_prompt,
-    )
+    result = _rule_based_edit(current_content, instruction)
+    return result, "fallback:rule-based"
 
 
 async def _call_openai_compatible(
+    *,
     base_url: str,
     api_key: str,
     model: str,
-    user_prompt: str,
+    current_soul: str,
+    instruction: str,
 ) -> str:
-    """Call any OpenAI-compatible /chat/completions endpoint via httpx."""
+    """Call any OpenAI-compatible /chat/completions endpoint via httpx.
+
+    Unlike the old version, this builds the user prompt inline so there is
+    no split between _call_llm and _call_openai_compatible — one less place
+    for provider-registry lookups to silently return empty strings.
+    """
     import httpx
+
+    user_prompt = (
+        f"# 当前 SOUL.md\n\n```markdown\n{current_soul}\n```\n\n"
+        f"# 修改意图\n\n{instruction}\n\n"
+        f"# 输出要求\n\n"
+        f"- 直接输出【完整的、修改后的 SOUL.md 全文】\n"
+        f"- 不要前言、不要解释、不要 ``` 代码块标记\n"
+        f"- 保持原有 markdown 结构和未被要求修改的段落\n"
+        f"- 如果修改意图不明确，原样返回\n"
+    )
 
     url = base_url.rstrip("/") + "/chat/completions"
     payload = {
@@ -437,25 +428,88 @@ async def _call_openai_compatible(
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(90.0)) as client:
         r = await client.post(url, json=payload, headers=headers)
         r.raise_for_status()
         data = r.json()
     return data["choices"][0]["message"]["content"]
 
 
-def _rule_based_edit(current: str, instruction: str) -> str:
-    """Deterministic fallback when no LLM is configured.
+def _strip_quotes(s: str) -> str:
+    for q in ("\u201c", "\u201d", "\u300c", "\u300d", '"', "'"):
+        s = s.replace(q, "")
+    return s.strip()
 
-    Not smart at all — it just tries a couple of common edits (prepend /
-    append a remark). This keeps the endpoint functional locally so the
-    UI can be developed against it even without an API key.
+
+def _rule_based_edit(current: str, instruction: str) -> str:
+    """Deterministic fallback — real keyword/number substitution.
+
+    Patterns:
+      - "把 X 改成 Y" / "将 X 改为 Y"                  → string replace
+      - "条数上限改成 5 条" / "最多 N 条"              → number replace
+      - "去掉 X" / "删除 X" / "不要 X"                 → remove keyword lines
+      - "加一句 X" / "添加 X"                          → insert before first ##
+    Returns current unchanged if nothing matches (no more dumb append).
     """
-    needle = instruction.strip()
-    remark = f"\n\n> 💡 自动修改标记：{needle}\n"
-    if remark in current:
-        return current  # already applied
-    return current.rstrip() + remark
+    import re
+
+    text = current
+    instr = instruction.strip()
+
+    # 1. String replace: 把 X 改成 Y / 将 X 改为 Y
+    #    Match: 把|将 ... 里的| ... 中的 ... X ... 改成|改为|换成 Y
+    m = re.match(r".+?([\u4e00-\u9fa5A-Za-z0-9_\-]+).+?(改成|改为|换成|替换为)\s*([\u4e00-\u9fa5A-Za-z0-9_\-]+)", instr)
+    if m:
+        old = _strip_quotes(m.group(1))
+        new = _strip_quotes(m.group(3))
+        if old and new and old != new and old in text:
+            text = text.replace(old, new)
+            logger.info("rule-based: replaced %r -> %r", old, new)
+
+    # 2. Number replace: 条数上限改成 5 条 / 最多 N 次
+    m = re.search(r"(?:条数上限|条数限制|最多|上限)[^\d]*(\d+)", instr)
+    if m:
+        new_num = m.group(1)
+        text = re.sub(r"(条数上限[:：]?\s*)\d+(\s*条?)", lambda mm: mm.group(1) + new_num + mm.group(2), text)
+        text = re.sub(r"(最多[:：]?\s*)\d+(\s*(?:条|次|段))", lambda mm: mm.group(1) + new_num + mm.group(2), text)
+        logger.info("rule-based: number -> %s", new_num)
+
+    # 3. Remove: 去掉 X / 删除 X / 不要 X
+    for kw in ("去掉", "删除", "移除", "不要", "删掉"):
+        idx = instr.find(kw)
+        if idx >= 0:
+            rest = instr[idx + len(kw):].strip()
+            rest = _strip_quotes(rest).rstrip("。，,.")
+            if rest and len(rest) > 1:
+                lines = text.splitlines()
+                before = len(lines)
+                lines = [ln for ln in lines if rest not in ln]
+                if len(lines) < before:
+                    text = "\n".join(lines)
+                    logger.info("rule-based: removed %r lines", rest)
+            break
+
+    # 4. Insert: 加一句 X / 添加 X
+    for kw in ("加一句", "添加", "加入", "新增"):
+        idx = instr.find(kw)
+        if idx >= 0:
+            rest = instr[idx + len(kw):].strip()
+            rest = _strip_quotes(rest).rstrip("。，,.")
+            if rest and len(rest) > 1:
+                lines = text.splitlines()
+                insert_at = len(lines)
+                for i, ln in enumerate(lines):
+                    if ln.startswith("##"):
+                        insert_at = i
+                        break
+                lines.insert(insert_at, "> \U0001f4a1 " + rest)
+                text = "\n".join(lines)
+                logger.info("rule-based: added %r", rest)
+            break
+
+    if text == current:
+        logger.info("rule-based: no pattern matched, returning unchanged")
+    return text
 
 
 # ── Hook helper ────────────────────────────────────────────────────────────
