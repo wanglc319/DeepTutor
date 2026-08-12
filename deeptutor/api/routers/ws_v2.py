@@ -186,6 +186,12 @@ def _typing_delay_ms(sentence: str) -> int:
     return max(1000, base + jitter)
 
 
+async def _maybe_run_sales_intent(user_id: str, user_text: str) -> str | None:
+    """委托给 sales.service.maybe_run_sales_intent 公共入口."""
+    from deeptutor.sales.service import maybe_run_sales_intent as _maybe
+    return await _maybe(user_id, user_text)
+
+
 # ───────────────────────── event builders ──────────────────────────────
 
 _SCHEMA = "2.0"
@@ -394,6 +400,11 @@ async def _handle_turn(
     if not final_text:
         await safe_send(_err(message_id, "EMPTY_REPLY", "partner returned empty text"))
         return
+
+    # ── 销售意向度打分（可选，环境变量 SALES_INTENT_ENABLED=true 启用） ──
+    sales_action_text = await _maybe_run_sales_intent(user_id, user_text)
+    if sales_action_text:
+        final_text = final_text.rstrip() + sales_action_text
 
     # 4) 逐句打字机推送 —— 独立句，每条只含当前这一句
     sentences = _split_sentences(final_text)

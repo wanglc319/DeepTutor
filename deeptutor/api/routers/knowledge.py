@@ -1773,6 +1773,129 @@ async def connect_ima_route(payload: ConnectImaRequest):
     }
 
 
+class ProbeQdrantRequest(BaseModel):
+    host: str
+    port: int = 6333
+    collection_name: str
+
+
+class ConnectQdrantRequest(BaseModel):
+    name: str
+    host: str
+    port: int = 6333
+    collection_name: str
+    vector_name: str = ""
+    description: str = ""
+
+
+@router.post("/probe-qdrant")
+async def probe_qdrant_route(payload: ProbeQdrantRequest):
+    """Test-connect to a Qdrant collection before binding a KB to it.
+
+    Returns whether the host is reachable, whether the collection exists, its
+    vector dimension (so the caller can confirm it matches DeepTutor's active
+    embedding model), and the number of points indexed.
+    """
+    try:
+        from qdrant_client import QdrantClient
+        from qdrant_client.http.exceptions import UnexpectedResponse
+    except ImportError:
+        raise HTTPException(
+            status_code=400,
+            detail="qdrant-client package is not installed. Run `pip install qdrant-client`.",
+        )
+
+    verdict: dict = {
+        "host": payload.host,
+        "port": payload.port,
+        "collection_name": payload.collection_name,
+        "ok": False,
+        "reachable": False,
+        "collection_exists": False,
+        "vector_size": None,
+        "distance": None,
+        "points_count": 0,
+        "error": None,
+    }
+
+    try:
+        client = QdrantClient(host=payload.host, port=payload.port, timeout=5)
+        client.get_collections()
+        verdict["reachable"] = True
+    except Exception as exc:
+        verdict["error"] = f"Could not reach Qdrant at {payload.host}:{payload.port} ({exc})"
+        return verdict
+
+    try:
+        info = client.get_collection(payload.collection_name)
+        verdict["collection_exists"] = True
+        params = info.config.params
+        vectors = params.vectors
+        if hasattr(vectors, "size"):
+            verdict["vector_size"] = vectors.size
+            verdict["distance"] = str(vectors.distance) if vectors.distance else None
+        elif isinstance(vectors, dict):
+            first = next(iter(vectors.values()), None)
+            if first and hasattr(first, "size"):
+                verdict["vector_size"] = first.size
+        verdict["points_count"] = info.points_count or 0
+        verdict["ok"] = True
+    except UnexpectedResponse as exc:
+        verdict["error"] = f"Collection '{payload.collection_name}' not found: {exc}"
+    except Exception as exc:
+        verdict["error"] = f"Failed to read collection info: {exc}"
+
+    return verdict
+
+
+@router.post("/connect-qdrant")
+async def connect_qdrant_route(payload: ConnectQdrantRequest):
+    """Connect an external Qdrant collection as a retrieval-only knowledge base.
+
+    Re-probes server-side (never trusts the client's verdict), then registers a
+    pointer (``type: qdrant``). DeepTutor never writes to this collection — an
+    external writer (Dify / a custom ETL) owns indexing and document ingestion.
+    Retrieval is done by DeepTutor embedding the query with its active
+    embedding model and hitting Qdrant's search API.
+    """
+    probe = await probe_qdrant_route(
+        ProbeQdrantRequest(
+            host=payload.host,
+            port=payload.port,
+            collection_name=payload.collection_name,
+        )
+    )
+    if not probe.get("ok"):
+        raise HTTPException(status_code=400, detail=probe.get("error") or probe)
+
+    try:
+        manager = get_kb_manager()
+        entry = manager.register_qdrant_kb(
+            (payload.name or "").strip(),
+            payload.host.strip(),
+            int(payload.port),
+            payload.collection_name.strip(),
+            vector_name=(payload.vector_name or "").strip(),
+            description=(payload.description or "").strip(),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error connecting Qdrant knowledge base: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {
+        "status": "connected",
+        "name": entry["path"],
+        "rag_provider": entry["rag_provider"],
+        "host": entry["host"],
+        "port": entry["port"],
+        "collection_name": entry["collection_name"],
+        "vector_size": probe.get("vector_size"),
+        "points_count": probe.get("points_count"),
+    }
+
+
 @router.get("/list", response_model=list[KnowledgeBaseInfo])
 async def list_knowledge_bases():
     """List all available knowledge bases with their details."""

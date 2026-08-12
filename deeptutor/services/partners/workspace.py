@@ -113,6 +113,116 @@ def write_soul(partner_id: str, content: str) -> None:
     path.write_text(content or "", encoding="utf-8")
 
 
+# ── Partner config (kb_strategy etc.) ────────────────────────────
+
+PARTNER_CONFIG_FILENAME = "config.yaml"
+
+VALID_KB_STRATEGIES = (
+    "feishu_only",       # 只按飞书知识库
+    "faq_only",          # 只按 FAQ 话术知识库
+    "feishu_primary",    # 飞书为主，FAQ 为辅
+    "faq_primary",       # FAQ 为主，飞书为辅
+    "equal_weight",      # 飞书 + FAQ 同权重
+)
+
+DEFAULT_KB_STRATEGY = "equal_weight"
+
+# KB name keyword tags: 用于在不知道精确名字时识别知识库类型
+# 用户可以在 partner config 里覆盖 kb_tags
+DEFAULT_KB_TAGS = {
+    "feishu": ["feishu", "lark", "飞书", "wiki", "ai_english_sales"],
+    "faq": ["faq", "话术", "lisa_chat_history", "qa_"],
+}
+
+
+def _partner_config_path(partner_id: str) -> Path:
+    return Path(__file__).resolve().parents[2].parent / "data" / "partners" / partner_id / PARTNER_CONFIG_FILENAME
+
+
+def read_partner_config(partner_id: str) -> dict[str, Any]:
+    import yaml
+
+    path = _partner_config_path(partner_id)
+    if not path.exists():
+        return {"kb_strategy": DEFAULT_KB_STRATEGY}
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        logger.exception("Failed to parse partner config for %s", partner_id)
+        return {"kb_strategy": DEFAULT_KB_STRATEGY}
+    if not isinstance(raw, dict):
+        raw = {}
+    raw.setdefault("kb_strategy", DEFAULT_KB_STRATEGY)
+    return raw
+
+
+def write_partner_config(partner_id: str, cfg: dict[str, Any]) -> None:
+    import yaml
+
+    path = _partner_config_path(partner_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+
+def classify_kbs(kb_names: list[str], tags: dict[str, list[str]] | None = None) -> dict[str, list[str]]:
+    """把 KB 名字按 feishu / faq / other 分组."""
+    tags = tags or DEFAULT_KB_TAGS
+    groups: dict[str, list[str]] = {"feishu": [], "faq": [], "other": []}
+    for name in kb_names:
+        lower = name.lower()
+        matched = False
+        for kb_type, keywords in tags.items():
+            if any(kw.lower() in lower for kw in keywords):
+                groups[kb_type].append(name)
+                matched = True
+                break
+        if not matched:
+            groups["other"].append(name)
+    return groups
+
+
+def apply_kb_strategy(kb_names: list[str], strategy: str) -> list[str]:
+    """按策略过滤 KB 列表.
+
+    Strategies:
+      feishu_only   → 只返回 feishu 类 KB
+      faq_only      → 只返回 faq 类 KB
+      feishu_primary → feishu + faq（全部，标记在 prompt 里体现主次）
+      faq_primary    → faq + feishu
+      equal_weight   → feishu + faq（全部）
+    """
+    if strategy not in VALID_KB_STRATEGIES:
+        strategy = DEFAULT_KB_STRATEGY
+
+    groups = classify_kbs(kb_names)
+
+    if strategy == "feishu_only":
+        return groups["feishu"] or groups["faq"] or groups["other"]
+    if strategy == "faq_only":
+        return groups["faq"] or groups["feishu"] or groups["other"]
+    # 其余三种都用全部 KB，主次关系交给 prompt 层处理
+    return kb_names
+
+
+__all__ = [
+    "DEFAULT_SOUL",
+    "DEFAULT_KB_STRATEGY",
+    "VALID_KB_STRATEGIES",
+    "DEFAULT_KB_TAGS",
+    "apply_kb_strategy",
+    "classify_kbs",
+    "ensure_partner_workspace",
+    "list_assets",
+    "provision_assets",
+    "read_partner_config",
+    "read_soul",
+    "remove_asset",
+    "soul_path",
+    "write_partner_config",
+    "write_soul",
+]
+
+
 # ── Asset provisioning (runs in the requesting user's context) ────
 
 

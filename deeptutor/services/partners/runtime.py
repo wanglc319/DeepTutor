@@ -372,12 +372,15 @@ class PartnerRunner:
         )
         msg.metadata["_attachment_records"] = attachment_records
 
+        # Connected KBs (qdrant/ima/obsidian etc.) live under the global KB
+        # root, not the partner workspace — list them before entering the
+        # partner scope so we don't miss external KB pointers.
+        kb_names = self._list_kb_names()
         # Partner-scope context blocks (soul / skills / KBs) are assembled
         # inside the partner scope so the same service locators the chat
         # turn-runtime uses resolve to the partner workspace.
         with user_context(partner_user(self.partner_id, name=self.config.name)):
             skills_manifest = self._build_skills_manifest()
-            kb_names = self._list_kb_names()
 
         metadata: dict[str, Any] = {
             "turn_id": turn_id,
@@ -483,12 +486,19 @@ class PartnerRunner:
     def _list_kb_names(self) -> list[str]:
         try:
             from deeptutor.knowledge.manager import KnowledgeBaseManager
+            from deeptutor.services.partners.workspace import (
+                apply_kb_strategy,
+                read_partner_config,
+            )
             from deeptutor.services.path_service import get_path_service
 
             kb_root = get_path_service().get_knowledge_bases_root()
             if not kb_root.is_dir():
                 return []
-            return KnowledgeBaseManager(base_dir=str(kb_root)).list_knowledge_bases()
+            all_kbs = KnowledgeBaseManager(base_dir=str(kb_root)).list_knowledge_bases()
+            cfg = read_partner_config(self.partner_id)
+            strategy = cfg.get("kb_strategy", "equal_weight")
+            return apply_kb_strategy(all_kbs, strategy)
         except Exception:
             logger.warning("Failed to list KBs for partner %s", self.partner_id, exc_info=True)
             return []

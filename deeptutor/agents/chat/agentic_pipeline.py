@@ -1162,7 +1162,11 @@ class AgenticChatPipeline:
             return None
         if len(text) > KB_SEED_CHARS_PER_KB:
             text = text[:KB_SEED_CHARS_PER_KB].rstrip() + "\n...[truncated]"
-        return text, list(result.get("sources") or [])
+        raw_sources = list(metadata.get("sources") or [])
+        for src in raw_sources:
+            if isinstance(src, dict) and not src.get("kb_name"):
+                src["kb_name"] = kb_name
+        return text, raw_sources
 
     # ---- emissions / context guard --------------------------------------
 

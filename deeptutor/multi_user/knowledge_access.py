@@ -148,6 +148,26 @@ def resolve_kb(kb_ref: str, *, require_write: bool = False) -> KnowledgeResource
             read_only=True,
         )
 
+    # Connected KBs (qdrant / ima / obsidian / linked …) are global resources
+    # registered under the admin KB root — they have no on-disk folder of
+    # their own and should be visible to every scope (partners, agents,
+    # users alike) without an explicit grant. Fall back to the admin manager
+    # before giving up so the rag tool doesn't 404 in a partner scope.
+    admin_mgr = admin_kb_manager()
+    if name in admin_mgr.list_knowledge_bases():
+        entry = admin_mgr._load_config().get("knowledge_bases", {}).get(name, {})
+        from deeptutor.knowledge.kb_types import is_connected_kb
+
+        if is_connected_kb(entry):
+            return KnowledgeResource(
+                id=f"admin:kb:{name}",
+                name=name,
+                base_dir=admin_kb_base_dir(),
+                source="admin",
+                assigned=False,
+                read_only=True,
+            )
+
     raise HTTPException(status_code=404, detail=f"Knowledge base '{name}' not found")
 
 

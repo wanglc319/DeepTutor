@@ -89,15 +89,30 @@ class QdrantPipeline:
 
     def _search_qdrant(self, cfg: QdrantConfig, query_vector: List[float], top_k: int) -> list:
         client = self._client(cfg)
+        extra: dict[str, Any] = {}
+        if cfg.vector_name:
+            extra["vector_name"] = cfg.vector_name
+
+        # qdrant_client >= 1.10 移除了 client.search，改用 query_points
+        if hasattr(client, "query_points"):
+            resp = client.query_points(
+                collection_name=cfg.collection_name,
+                query=query_vector,
+                limit=top_k,
+                with_payload=True,
+                **extra,
+            )
+            return list(resp.points)
+
+        # 旧版 fallback (qdrant_client < 1.10)
         search_kwargs: dict[str, Any] = {
             "collection_name": cfg.collection_name,
             "query_vector": query_vector,
             "limit": top_k,
             "with_payload": True,
+            **extra,
         }
-        if cfg.vector_name:
-            search_kwargs["vector_name"] = cfg.vector_name
-        return client.search(**search_kwargs)
+        return list(client.search(**search_kwargs))
 
     def _error_result(self, query: str, exc: Exception, *, error_type: str) -> Dict[str, Any]:
         return {
@@ -130,7 +145,13 @@ def _sources_from_hits(hits: list) -> list[dict[str, Any]]:
     sources: list[dict[str, Any]] = []
     for point in hits:
         payload = point.payload or {}
-        page_content = str(payload.get("page_content") or "").strip()
+
+        # page_content (Dify) vs faq_text (我们的 FAQ KB)
+        page_content = str(
+            payload.get("page_content") or payload.get("faq_text") or ""
+        ).strip()
+
+        # metadata 嵌套或顶层字段都照顾到
         metadata = payload.get("metadata") or {}
         if isinstance(metadata, str):
             try:
@@ -138,13 +159,48 @@ def _sources_from_hits(hits: list) -> list[dict[str, Any]]:
                 metadata = json.loads(metadata)
             except Exception:
                 metadata = {}
-        doc_id = str(metadata.get("doc_id") or payload.get("group_id") or "")
-        title = str(metadata.get("filename") or metadata.get("name") or doc_id or f"Point {point.id}")
+
+        # 标题优先级: original_title (Dify) > metadata.filename > metadata.name > topic (章节) > fallback
+        title = str(
+            payload.get("original_title")
+            or metadata.get("filename")
+            or metadata.get("name")
+            or payload.get("topic")
+            or ""
+        ).strip()
+
+        # 文件名/来源路径: source_file (Dify) > filename > source
+        source = str(
+            payload.get("source_file")
+            or payload.get("filename")
+            or payload.get("source")
+            or metadata.get("filename")
+            or ""
+        ).strip()
+
+        # 从 source_file 里提取纯文件名
+        source_basename = ""
+        if source:
+            import os
+            source_basename = os.path.basename(source)
+
+        page = payload.get("page") or metadata.get("page")
+
+        doc_id = str(
+            metadata.get("doc_id")
+            or payload.get("group_id")
+            or source_basename
+            or title
+            or ""
+        )
+
         sources.append(
             {
-                "title": title,
+                "title": title or source_basename or f"Point {point.id}",
                 "content": page_content[:500],
-                "source": doc_id,
+                "source": source_basename or doc_id,
+                "source_path": source,
+                "topic": str(payload.get("topic") or ""),
                 "chunk_id": str(point.id),
                 "score": round(point.score, 4) if point.score is not None else 0.0,
             }

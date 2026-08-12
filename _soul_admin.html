@@ -1,0 +1,673 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>Soul Admin — SOUL.md + KB策略 + 模拟会话</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    margin: 0; padding: 0; background: #f5f6f8;
+    height: 100vh; display: flex; flex-direction: column;
+  }
+  header {
+    background: #1f2937; color: #fff; padding: 10px 20px;
+    display: flex; align-items: center; gap: 12px; flex-shrink: 0;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header input, header select, header button {
+    padding: 6px 12px; border-radius: 6px; border: 1px solid #374151;
+    background: #111827; color: #fff; font-size: 13px;
+  }
+  header button { cursor: pointer; background: #2563eb; border-color: #2563eb; }
+  header button:hover { background: #1d4ed8; }
+  header button.ghost { background: #374151; border-color: #4b5563; }
+  header button.ghost:hover { background: #4b5563; }
+  header .spacer { flex: 1; }
+  header .status { font-size: 12px; padding: 4px 10px; border-radius: 12px; }
+  .ok { background: #065f46; color: #a7f3d0; }
+  .err { background: #7f1d1d; color: #fecaca; }
+
+  main { flex: 1; display: flex; overflow: hidden; }
+
+  /* 左侧：编辑 + 策略 */
+  .left-panel {
+    flex: 1; display: flex; flex-direction: column; overflow: hidden;
+    gap: 12px; padding: 12px; min-width: 0;
+  }
+
+  /* 右侧：多会话聊天 */
+  .right-panel {
+    width: 520px; display: flex; flex-direction: column;
+    border-left: 1px solid #e5e7eb; background: #fff;
+    flex-shrink: 0;
+  }
+  .chat-header {
+    padding: 10px 14px; border-bottom: 1px solid #e5e7eb;
+    display: flex; align-items: center; gap: 8px; background: #fafbfc;
+  }
+  .chat-header h2 { font-size: 13px; margin: 0; font-weight: 600; flex: 1; color: #111827; }
+
+  .chat-layout { flex: 1; display: flex; overflow: hidden; }
+  .session-sidebar {
+    width: 180px; border-right: 1px solid #e5e7eb;
+    display: flex; flex-direction: column; background: #f9fafb;
+    flex-shrink: 0;
+  }
+  .session-sidebar .ss-header {
+    padding: 8px; display: flex; gap: 4px; border-bottom: 1px solid #e5e7eb;
+  }
+  .session-sidebar button {
+    flex: 1; padding: 5px; font-size: 11px; border: 1px solid #e5e7eb;
+    background: #fff; border-radius: 4px; cursor: pointer;
+  }
+  .session-sidebar button:hover { background: #eff6ff; border-color: #93c5fd; }
+  .session-list { flex: 1; overflow-y: auto; padding: 6px; }
+  .session-item {
+    padding: 7px 9px; border-radius: 6px; cursor: pointer;
+    font-size: 12px; color: #374151; margin-bottom: 2px;
+    border: 1px solid transparent; display: flex; justify-content: space-between; gap: 4px;
+    word-break: break-all;
+  }
+  .session-item:hover { background: #eef2ff; }
+  .session-item.active { background: #e0e7ff; border-color: #a5b4fc; color: #3730a3; font-weight: 500; }
+  .session-item .count { font-size: 10px; background: #dbeafe; color: #1d4ed8; padding: 1px 5px; border-radius: 8px; flex-shrink: 0; }
+  .session-item .del { color: #d1d5db; cursor: pointer; font-size: 11px; }
+  .session-item .del:hover { color: #dc2626; }
+
+  .chat-main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+  .chat-session-info {
+    padding: 6px 12px; font-size: 11px; color: #9ca3af;
+    border-bottom: 1px solid #f3f4f6; background: #fff;
+    font-family: "JetBrains Mono", Consolas, monospace;
+  }
+
+  .card {
+    background: #fff; border-radius: 10px; padding: 14px;
+    box-shadow: 0 1px 3px rgba(0,0,0,.06); display: flex; flex-direction: column;
+    overflow: hidden;
+  }
+  .card-title {
+    font-size: 13px; font-weight: 600; color: #374151; margin-bottom: 10px;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .card-title .hint { font-size: 11px; color: #9ca3af; font-weight: normal; }
+
+  /* SOUL editor */
+  #soul-card { flex: 1; }
+  .editor-row { display: flex; gap: 10px; flex: 1; min-height: 0; }
+  .editor-pane, .preview-pane { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .pane-label { font-size: 11px; color: #9ca3af; margin-bottom: 6px; text-transform: uppercase; }
+  #soul-editor, .preview-pane .md-body {
+    flex: 1; border: 1px solid #e5e7eb; border-radius: 6px;
+    padding: 12px; font-family: "JetBrains Mono", Consolas, monospace;
+    font-size: 13px; line-height: 1.6; resize: none; outline: none;
+    overflow: auto; background: #fafbfc;
+  }
+  #soul-editor:focus { border-color: #2563eb; }
+  .preview-pane .md-body { background: #fff; font-family: inherit; color: #111827; }
+  .preview-pane .md-body h1 { font-size: 18px; margin: 0 0 8px; }
+  .preview-pane .md-body h2 { font-size: 15px; margin: 12px 0 6px; }
+  .preview-pane .md-body h3 { font-size: 13px; margin: 10px 0 4px; color: #374151; }
+  .preview-pane .md-body p { margin: 4px 0; }
+  .preview-pane .md-body code { background: #f3f4f6; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+  .preview-pane .md-body pre { background: #111827; color: #e5e7eb; padding: 10px; border-radius: 6px; overflow: auto; font-size: 12px; }
+
+  /* Config */
+  #config-card { flex-shrink: 0; }
+  .strategy-list { display: flex; flex-direction: column; gap: 6px; }
+  .strategy-item {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 10px; border: 1px solid #e5e7eb; border-radius: 6px;
+    cursor: pointer; transition: all .15s;
+  }
+  .strategy-item:hover { border-color: #93c5fd; background: #eff6ff; }
+  .strategy-item.active { border-color: #2563eb; background: #dbeafe; }
+  .strategy-item input { margin: 0; }
+  .strategy-item .label { font-size: 13px; font-weight: 500; color: #1f2937; }
+  .strategy-item .desc { font-size: 11px; color: #9ca3af; margin-left: auto; }
+  .kb-group-list {
+    margin-top: 10px; padding-top: 10px; border-top: 1px dashed #e5e7eb;
+    font-size: 12px; color: #6b7280;
+  }
+  .kb-group-list div { margin: 2px 0; }
+  .kb-group-list .tag {
+    display: inline-block; padding: 1px 6px; border-radius: 3px;
+    font-size: 10px; margin-right: 6px; font-weight: 600;
+  }
+  .tag-feishu { background: #dbeafe; color: #1d4ed8; }
+  .tag-faq { background: #dcfce7; color: #15803d; }
+  .tag-other { background: #f3f4f6; color: #6b7280; }
+  .tag-active { margin-left: 4px; background: #2563eb; color: #fff; }
+  .row-actions { margin-top: 10px; display: flex; justify-content: flex-end; gap: 8px; }
+  .btn-ghost { padding: 5px 14px; font-size: 12px; border: 1px solid #e5e7eb; background: #fff; border-radius: 5px; cursor: pointer; }
+  .btn-ghost:hover { background: #f3f4f6; }
+
+  /* Chat */
+  .chat-messages {
+    flex: 1; overflow-y: auto; padding: 12px; background: #fafbfc;
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .msg { padding: 8px 12px; border-radius: 10px; font-size: 13px; line-height: 1.5; max-width: 90%; white-space: pre-wrap; word-break: break-word; }
+  .msg.user { background: #dbeafe; color: #1e40af; align-self: flex-end; border-bottom-right-radius: 2px; }
+  .msg.ai { background: #fff; color: #111827; border: 1px solid #e5e7eb; align-self: flex-start; border-bottom-left-radius: 2px; }
+  .msg.ai.thinking::before { content: "💭 "; }
+  .msg.ai.streaming::after { content: "▌"; animation: blink 1s infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .msg.error { background: #fef2f2; color: #dc2626; border: 1px solid #fecaca; }
+  .msg-meta { margin-top: 6px; padding-top: 5px; border-top: 1px dashed #e5e7eb; font-size: 11px; line-height: 1.6; color: #6b7280; display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; }
+  .msg-meta .meta-timing { color: #0891b2; font-weight: 600; }
+  .msg-meta .meta-label { color: #374151; }
+  .msg-meta .meta-chip {
+    display: inline-block; padding: 1px 8px; border-radius: 10px;
+    font-size: 11px; background: #f0f9ff; color: #0369a1;
+    border: 1px solid #bae6fd; cursor: default;
+  }
+  .msg-meta .meta-chip.score { background: #fef3c7; color: #92400e; border-color: #fde68a; }
+  .msg-meta .meta-sep { color: #d1d5db; }
+  .chat-input-row { display: flex; gap: 6px; padding: 10px; border-top: 1px solid #e5e7eb; background: #fff; }
+  .chat-input-row textarea {
+    flex: 1; padding: 8px 10px; border: 1px solid #e5e7eb; border-radius: 6px;
+    font-size: 13px; resize: none; height: 50px; outline: none;
+  }
+  .chat-input-row textarea:focus { border-color: #2563eb; }
+  .chat-input-row button {
+    padding: 0 16px; background: #2563eb; color: #fff; border: none;
+    border-radius: 6px; cursor: pointer; font-size: 13px;
+  }
+  .chat-input-row button:disabled { background: #9ca3af; cursor: not-allowed; }
+
+  .empty-chat { text-align: center; padding: 40px 20px; color: #9ca3af; font-size: 13px; }
+
+  /* Toast */
+  .toast {
+    position: fixed; top: 60px; right: 20px; padding: 10px 18px;
+    border-radius: 8px; font-size: 13px; z-index: 1000;
+    animation: slideIn .3s, fadeOut .3s 2s forwards;
+  }
+  .toast.ok { background: #059669; color: #fff; }
+  .toast.err { background: #dc2626; color: #fff; }
+  @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+  @keyframes fadeOut { to { opacity: 0; transform: translateY(-10px); } }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🎛 Soul Admin</h1>
+  <input id="partner-id" placeholder="partner_id" value="lisa" style="width:100px">
+  <button onclick="loadAll()">🔄 加载</button>
+  <div class="spacer"></div>
+  <span id="status" class="status ok">就绪</span>
+</header>
+
+<main>
+  <div class="left-panel">
+    <div class="card" id="soul-card">
+      <div class="card-title">
+        <span>💬 SOUL.md 编辑</span>
+        <div style="display:flex;gap:8px">
+          <span class="hint">保存后下次会话自动注入</span>
+          <button class="btn-ghost" onclick="saveSoul()">💾 保存 SOUL</button>
+        </div>
+      </div>
+      <div class="editor-row">
+        <div class="editor-pane">
+          <div class="pane-label">Markdown 源码</div>
+          <textarea id="soul-editor" spellcheck="false" oninput="renderPreview()"></textarea>
+        </div>
+        <div class="preview-pane">
+          <div class="pane-label">实时预览</div>
+          <div class="md-body" id="soul-preview"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" id="config-card">
+      <div class="card-title"><span>📚 知识库策略</span><span class="hint">下次会话生效</span></div>
+      <div class="strategy-list" id="strategy-list"></div>
+      <div class="kb-group-list" id="kb-groups"></div>
+      <div class="row-actions">
+        <button class="btn-ghost" onclick="saveConfig()">💾 保存策略</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="right-panel">
+    <div class="chat-header">
+      <h2>🧪 模拟会话</h2>
+      <button onclick="createNewSession()" class="ghost" style="padding:3px 10px;font-size:11px">＋ 新会话</button>
+    </div>
+    <div class="chat-layout">
+      <div class="session-sidebar">
+        <div class="ss-header">
+          <button onclick="clearAllSessions()">🗑 全部清除</button>
+        </div>
+        <div class="session-list" id="session-list"></div>
+      </div>
+      <div class="chat-main">
+        <div class="chat-session-info" id="session-info">（选择或创建一个会话）</div>
+        <div class="chat-messages" id="chat-messages">
+          <div class="empty-chat">← 点左侧"＋ 新会话"创建会话开始测试</div>
+        </div>
+        <div class="chat-input-row">
+          <textarea id="chat-input" placeholder="输入消息，Enter 发送，Shift+Enter 换行" onkeydown="handleChatKey(event)"></textarea>
+          <button id="chat-send" onclick="sendChat()" disabled>发送</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</main>
+
+<script>
+const API = () => {
+  const pid = document.getElementById('partner-id').value.trim();
+  return `/api/v1/partners/${pid}`;
+};
+
+const STORAGE_KEY = 'soul_admin_sessions_v1';
+
+// ── 全局状态 ──
+let sessions = {};          // { key: { messages: [{role,text}], created } }
+let currentSessionKey = null;
+let chatAbort = null;
+
+function loadSessions() {
+  try { sessions = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'); }
+  catch { sessions = {}; }
+}
+function saveSessions() { localStorage.setItem(STORAGE_KEY, JSON.stringify(sessions)); }
+
+function toast(msg, kind = 'ok') {
+  const el = document.createElement('div');
+  el.className = `toast ${kind}`;
+  el.textContent = msg;
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 2500);
+}
+function setStatus(text, kind = 'ok') {
+  const s = document.getElementById('status');
+  s.textContent = text;
+  s.className = `status ${kind}`;
+}
+
+// ── SOUL ──
+function renderPreview() {
+  const src = document.getElementById('soul-editor').value;
+  document.getElementById('soul-preview').innerHTML = simpleMarkdown(src);
+}
+function simpleMarkdown(md) {
+  return md
+    .replace(/```([\s\S]*?)```/g, (m, code) => `<pre><code>${escapeHtml(code)}</code></pre>`)
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/^### (.+)$/gm, '<h3>$1</h3>')
+    .replace(/^## (.+)$/gm, '<h2>$1</h2>')
+    .replace(/^# (.+)$/gm, '<h1>$1</h1>')
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/\n/g, '<br>');
+}
+function escapeHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+async function loadSoul() {
+  const r = await fetch(`${API()}/soul`);
+  const data = await r.json();
+  document.getElementById('soul-editor').value = data.content || '';
+  renderPreview();
+}
+async function saveSoul() {
+  try {
+    setStatus('保存 SOUL 中...');
+    await fetch(`${API()}/soul`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: document.getElementById('soul-editor').value })
+    });
+    setStatus('SOUL 已保存 ✅');
+    toast('SOUL.md 已保存（下次会话自动生效）');
+  } catch (e) {
+    setStatus('保存失败 ❌', 'err');
+    toast('保存失败: ' + e.message, 'err');
+  }
+}
+
+// ── KB Strategy ──
+const STRATEGIES = [
+  { id: 'feishu_only',    label: '仅飞书知识库',        desc: '只用 knowledge_feishu_v1' },
+  { id: 'faq_only',       label: '仅 FAQ 话术知识库',   desc: '只用 knowledge_faq_v1' },
+  { id: 'feishu_primary', label: '飞书为主 FAQ 为辅',  desc: '飞书优先 + FAQ 补充' },
+  { id: 'faq_primary',    label: 'FAQ 为主 飞书为辅',   desc: 'FAQ 优先 + 飞书补充' },
+  { id: 'equal_weight',   label: '飞书 + FAQ 同权重',  desc: '全部 KB 同等对待' },
+];
+let currentStrategy = 'equal_weight';
+let kbGroups = { feishu: [], faq: [], other: [] };
+let effectiveKbs = [];
+
+function renderStrategyList() {
+  const el = document.getElementById('strategy-list');
+  el.innerHTML = STRATEGIES.map(s => `
+    <label class="strategy-item ${s.id === currentStrategy ? 'active' : ''}">
+      <input type="radio" name="strategy" value="${s.id}" ${s.id === currentStrategy ? 'checked' : ''} onchange="onStrategyChange('${s.id}')">
+      <span class="label">${s.label}</span>
+      <span class="desc">${s.desc}</span>
+    </label>
+  `).join('');
+}
+function renderKbGroups() {
+  const el = document.getElementById('kb-groups');
+  const parts = [];
+  for (const [group, kbs] of Object.entries(kbGroups)) {
+    if (!kbs.length) continue;
+    const has = effectiveKbs.some(k => kbs.includes(k));
+    parts.push(`<div><span class="tag tag-${group}">${group}</span>${kbs.join(', ')} ${has ? '<span class="tag-active">✓生效</span>' : ''}</div>`);
+  }
+  parts.push(`<div style="margin-top:4px;padding-top:4px;border-top:1px dashed #e5e7eb">
+    实际生效: ${effectiveKbs.map(k => `<code>${k}</code>`).join(', ') || '<em>（无）</em>'}
+  </div>`);
+  el.innerHTML = parts.join('');
+}
+function onStrategyChange(id) {
+  currentStrategy = id;
+  if (id === 'feishu_only') effectiveKbs = kbGroups.feishu.length ? kbGroups.feishu : [...kbGroups.faq, ...kbGroups.other];
+  else if (id === 'faq_only') effectiveKbs = kbGroups.faq.length ? kbGroups.faq : [...kbGroups.feishu, ...kbGroups.other];
+  else effectiveKbs = [...kbGroups.feishu, ...kbGroups.faq, ...kbGroups.other];
+  renderStrategyList();
+  renderKbGroups();
+}
+async function loadConfig() {
+  const r = await fetch(`${API()}/config`);
+  const data = await r.json();
+  currentStrategy = data.config.kb_strategy || 'equal_weight';
+  kbGroups = data.kb_groups || { feishu: [], faq: [], other: [] };
+  effectiveKbs = data.effective_kbs || [];
+  renderStrategyList();
+  renderKbGroups();
+}
+async function saveConfig() {
+  try {
+    setStatus('保存策略中...');
+    await fetch(`${API()}/config`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kb_strategy: currentStrategy })
+    });
+    setStatus('策略已保存 ✅');
+    toast('知识库策略已保存（下次会话自动生效）');
+    await loadConfig();
+  } catch (e) {
+    setStatus('保存失败 ❌', 'err');
+    toast('保存失败: ' + e.message, 'err');
+  }
+}
+
+// ── Sessions ──
+function createNewSession() {
+  const key = 'sess_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6);
+  sessions[key] = { messages: [], created: Date.now() };
+  currentSessionKey = key;
+  saveSessions();
+  renderSessionList();
+  renderCurrentSession();
+  toast('新会话: ' + key);
+}
+function deleteSession(key) {
+  delete sessions[key];
+  if (currentSessionKey === key) currentSessionKey = Object.keys(sessions)[0] || null;
+  saveSessions();
+  renderSessionList();
+  renderCurrentSession();
+}
+function clearAllSessions() {
+  if (!confirm('确定清除所有会话？')) return;
+  sessions = {}; currentSessionKey = null;
+  saveSessions();
+  renderSessionList();
+  renderCurrentSession();
+}
+function selectSession(key) {
+  if (key === currentSessionKey) return;
+  currentSessionKey = key;
+  renderSessionList();
+  renderCurrentSession();
+}
+function renderSessionList() {
+  const el = document.getElementById('session-list');
+  const keys = Object.keys(sessions).sort((a, b) => sessions[b].created - sessions[a].created);
+  if (!keys.length) { el.innerHTML = '<div style="padding:10px;font-size:11px;color:#9ca3af;text-align:center">无会话</div>'; return; }
+  el.innerHTML = keys.map(k => {
+    const s = sessions[k];
+    const preview = (s.messages.find(m => m.role === 'user')?.text || '').slice(0, 16) || '(空会话)';
+    const count = s.messages.length;
+    const active = k === currentSessionKey ? 'active' : '';
+    return `<div class="session-item ${active}" onclick="selectSession('${k.replace(/'/g, "\\'")}')">
+      <span>${preview}</span>
+      <span style="display:flex;align-items:center;gap:4px">
+        <span class="count">${count}</span>
+        <span class="del" onclick="event.stopPropagation();deleteSession('${k.replace(/'/g, "\\'")}')">×</span>
+      </span>
+    </div>`;
+  }).join('');
+}
+function renderCurrentSession() {
+  const box = document.getElementById('chat-messages');
+  const sendBtn = document.getElementById('chat-send');
+  const info = document.getElementById('session-info');
+  if (!currentSessionKey || !sessions[currentSessionKey]) {
+    box.innerHTML = '<div class="empty-chat">← 点左侧"＋ 新会话"创建会话开始测试</div>';
+    info.textContent = '';
+    sendBtn.disabled = true;
+    return;
+  }
+  const s = sessions[currentSessionKey];
+  info.textContent = `session_key = ${currentSessionKey}`;
+  sendBtn.disabled = !!chatAbort;
+  if (!s.messages.length) {
+    box.innerHTML = '<div class="empty-chat">还没有消息 — 在下方输入框发第一条消息吧</div>';
+    return;
+  }
+  box.innerHTML = s.messages.map(m => {
+    const metaHtml = m.role === 'ai' && m.meta ? _renderMsgMeta(m.meta) : '';
+    return `<div class="msg ${m.role}">${escapeHtml(m.text)}${metaHtml}</div>`;
+  }).join('');
+  box.scrollTop = box.scrollHeight;
+}
+
+// ── Chat send (普通 JSON + 前端分句打字机) ──
+
+function _renderMsgMeta(meta) {
+  const parts = [];
+  if (meta.elapsed_ms != null) {
+    const s = meta.elapsed_ms < 1000
+      ? meta.elapsed_ms + ' ms'
+      : (meta.elapsed_ms / 1000).toFixed(1) + ' s';
+    parts.push(`<span class="meta-timing">⏱ ${s}</span>`);
+  }
+  if (meta.sources && meta.sources.length) {
+    parts.push(`<span class="meta-label">📚 资料来源</span>`);
+    for (const src of meta.sources) {
+      const docTitle = src.title || src.source || src.filename || '';
+      const sourceFile = src.source || src.filename || '';
+      const kbLabel = src.kb_name || '';
+      const scorePct = src.score != null ? `· ${(src.score * 100).toFixed(0)}%` : '';
+      const pageLabel = src.page ? `· p.${src.page}` : '';
+      const topicLabel = src.topic ? `· ${src.topic}` : '';
+      // chip 主显示: title (退化 source)，hover 显示完整元数据
+      const chipText = docTitle ? escapeHtml(docTitle) + scorePct : (escapeHtml(sourceFile || kbLabel));
+      const tooltip = escapeHtml(
+        [
+          docTitle ? `标题: ${docTitle}` : null,
+          sourceFile && sourceFile !== docTitle ? `文件: ${sourceFile}` : null,
+          topicLabel ? `章节: ${src.topic}` : null,
+          kbLabel ? `知识库: ${kbLabel}` : null,
+          src.score != null ? `相似度: ${(src.score * 100).toFixed(1)}%` : null,
+          src.page ? `页码: ${src.page}` : null,
+        ].filter(Boolean).join(' ｜ ')
+      );
+      const chipCls = src.score != null ? 'meta-chip score' : 'meta-chip';
+      parts.push(`<span class="${chipCls}" title="${tooltip}">${chipText}</span>`);
+    }
+  }
+  if (!parts.length) return '';
+  return `<div class="msg-meta">${parts.join('<span class="meta-sep">|</span>')}</div>`;
+}
+
+function handleChatKey(e) {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(); }
+}
+
+const _HARD_TERMINATORS = new Set('。！？.!?'.split(''));
+const _SOFT_TERMINATORS = new Set('，,'.split(''));
+const _MAX_CHARS = 40, _MIN_CHARS = 3, _IDEAL_CHARS = 18;
+
+function splitSentences(text) {
+  if (!text || !text.trim()) return [];
+  text = text.replace(/[ \t]+/g, ' ').trim();
+  const raw = [], buf = [];
+  for (const ch of text) {
+    buf.push(ch);
+    if (ch === '\n' || _HARD_TERMINATORS.has(ch)) {
+      const s = buf.join('').trim(); if (s) raw.push(s); buf.length = 0;
+    } else if (_SOFT_TERMINATORS.has(ch) && buf.join('').trim().length >= _IDEAL_CHARS) {
+      const s = buf.join('').trim(); if (s) raw.push(s); buf.length = 0;
+    }
+  }
+  const tail = buf.join('').trim(); if (tail) raw.push(tail);
+  const expanded = [];
+  for (const part of raw) {
+    if (part.length <= _MAX_CHARS) expanded.push(part);
+    else for (let i = 0; i < part.length; i += _IDEAL_CHARS) {
+      const s = part.slice(i, i + _IDEAL_CHARS).trim(); if (s) expanded.push(s);
+    }
+  }
+  const merged = [];
+  for (const chunk of expanded) {
+    if (merged.length && chunk.length < _MIN_CHARS && merged[merged.length-1].length + chunk.length <= _MAX_CHARS) {
+      merged[merged.length-1] += chunk;
+    } else merged.push(chunk);
+  }
+  return merged;
+}
+
+function typingDelay(sentence) {
+  if (!sentence) return 0;
+  const visible = sentence.replace(/[\u{1F300}-\u{1FAFF}\u2600-\u27BF]|@\w+/gu, '');
+  return Math.max(150, Math.min(1200, 250 + visible.length * 40));
+}
+
+async function sendChat() {
+  const input = document.getElementById('chat-input');
+  const text = input.value.trim();
+  if (!text || chatAbort || !currentSessionKey) return;
+
+  sessions[currentSessionKey].messages.push({ role: 'user', text });
+  input.value = '';
+  renderCurrentSession();
+
+  const sendBtn = document.getElementById('chat-send');
+  sendBtn.disabled = true;
+  chatAbort = { aborted: false };
+  const controller = new AbortController();
+  chatAbort.controller = controller;
+
+  const box = document.getElementById('chat-messages');
+  const thinkingEl = document.createElement('div');
+  thinkingEl.className = 'msg ai thinking';
+  thinkingEl.textContent = '🤔 思考中...';
+  box.appendChild(thinkingEl);
+  box.scrollTop = box.scrollHeight;
+
+  try {
+    const resp = await fetch(`${API()}/chat`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: text, session_key: currentSessionKey }),
+      signal: controller.signal,
+    });
+    if (!resp.ok) {
+      const errText = await resp.text();
+      box.appendChild(Object.assign(document.createElement('div'),
+        { className: 'msg error', textContent: `HTTP ${resp.status}: ${errText}` }));
+      thinkingEl.remove();
+      return;
+    }
+    const data = await resp.json();
+    const fullText = (data.content || '').trim();
+    const msgMeta = {
+      elapsed_ms: data.elapsed_ms != null ? data.elapsed_ms : null,
+      sources: Array.isArray(data.sources) ? data.sources : [],
+    };
+    thinkingEl.remove();
+
+    if (!fullText) {
+      box.appendChild(Object.assign(document.createElement('div'),
+        { className: 'msg error', textContent: '⚠️ 服务返回空内容' }));
+      return;
+    }
+
+    const sentences = splitSentences(fullText);
+    const aiMsgEl = document.createElement('div');
+    aiMsgEl.className = 'msg ai streaming';
+    const textSpan = document.createElement('span');
+    aiMsgEl.appendChild(textSpan);
+    box.appendChild(aiMsgEl);
+
+    let i = 0, displayed = '';
+    const tick = () => {
+      if (chatAbort?.aborted) { sendBtn.disabled = false; return; }
+      if (i >= sentences.length) {
+        aiMsgEl.classList.remove('streaming');
+        const metaHtml = _renderMsgMeta(msgMeta);
+        if (metaHtml) aiMsgEl.insertAdjacentHTML('beforeend', metaHtml);
+        if (sessions[currentSessionKey]) {
+          sessions[currentSessionKey].messages.push({
+            role: 'ai', text: displayed, meta: msgMeta,
+          });
+          saveSessions();
+          renderSessionList();
+        }
+        chatAbort = null;
+        sendBtn.disabled = false;
+        return;
+      }
+      const s = sentences[i++];
+      displayed += (displayed ? '\n' : '') + s;
+      textSpan.textContent = displayed;
+      box.scrollTop = box.scrollHeight;
+      setTimeout(tick, typingDelay(s));
+    };
+    setTimeout(tick, 400);
+  } catch (e) {
+    if (e.name !== 'AbortError') {
+      box.appendChild(Object.assign(document.createElement('div'),
+        { className: 'msg error', textContent: '请求失败: ' + e.message }));
+      thinkingEl.remove();
+    }
+    chatAbort = null;
+    sendBtn.disabled = false;
+  }
+}
+
+// ── Boot ──
+async function loadAll() {
+  setStatus('加载中...');
+  try {
+    await Promise.all([loadSoul(), loadConfig()]);
+    setStatus('就绪 ✅');
+  } catch (e) {
+    setStatus('加载失败 ❌', 'err');
+    toast('加载失败: ' + e.message, 'err');
+  }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  renderStrategyList();
+  loadSessions();
+  if (Object.keys(sessions).length) {
+    currentSessionKey = Object.keys(sessions).sort((a, b) => sessions[b].created - sessions[a].created)[0];
+  }
+  renderSessionList();
+  renderCurrentSession();
+  loadAll();
+});
+</script>
+</body>
+</html>

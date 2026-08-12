@@ -14,11 +14,12 @@ import base64
 import binascii
 import json
 import logging
+import time
 from typing import Any, AsyncGenerator, Literal
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from deeptutor.core.i18n import t
@@ -29,6 +30,7 @@ from deeptutor.services.partners import (
     slugify_partner_id,
     slugify_soul_id,
 )
+from deeptutor.services.partners.sentence_split import split_sentences, TypingDelay
 from deeptutor.services.partners.manager import (
     LEGACY_GLOBAL_DELIVERY_KEYS,
     PartnerConfig,
@@ -37,16 +39,32 @@ from deeptutor.services.partners.manager import (
     strip_legacy_global_delivery,
 )
 from deeptutor.services.partners.workspace import (
+    VALID_KB_STRATEGIES,
+    apply_kb_strategy,
+    classify_kbs,
     list_assets,
     provision_assets,
+    read_partner_config,
     read_soul,
     remove_asset,
     strip_frontmatter,
+    write_partner_config,
     write_soul,
 )
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+# ── Soul Admin 静态页面 ─────────────────────────────────────────
+@router.get("/soul-admin", response_class=HTMLResponse, include_in_schema=False)
+async def soul_admin_page():
+    from pathlib import Path
+
+    html_path = Path(__file__).resolve().parents[3] / "_soul_admin.html"
+    if html_path.is_file():
+        return HTMLResponse(html_path.read_text(encoding="utf-8"))
+    return HTMLResponse("<pre>_soul_admin.html not found</pre>", status_code=404)
 
 
 # Per-partner async locks used to dedupe concurrent WebSocket-driven
@@ -152,6 +170,10 @@ class UpdatePartnerRequest(BaseModel):
 
 class SoulUpdateBody(BaseModel):
     content: str
+
+
+class PartnerConfigUpdate(BaseModel):
+    kb_strategy: str | None = None
 
 
 class AssetAddRequest(AssetSpec):
@@ -682,6 +704,50 @@ async def put_partner_soul(partner_id: str, payload: SoulUpdateBody):
     return {"partner_id": partner_id, "saved": True}
 
 
+@router.get("/{partner_id}/config")
+async def get_partner_config(partner_id: str):
+    """Get partner config (kb_strategy) + list all available KBs with classification."""
+    mgr = get_partner_manager()
+    if not mgr.partner_exists(partner_id):
+        raise HTTPException(status_code=404, detail=t("api.partner_not_found"))
+    cfg = read_partner_config(partner_id)
+    from deeptutor.services.path_service import get_path_service
+    from deeptutor.knowledge.manager import KnowledgeBaseManager
+
+    kb_root = get_path_service().get_knowledge_bases_root()
+    all_kbs: list[str] = []
+    if kb_root.is_dir():
+        all_kbs = KnowledgeBaseManager(base_dir=str(kb_root)).list_knowledge_bases()
+    groups = classify_kbs(all_kbs)
+    effective = apply_kb_strategy(all_kbs, cfg.get("kb_strategy", "equal_weight"))
+    return {
+        "partner_id": partner_id,
+        "config": cfg,
+        "valid_strategies": list(VALID_KB_STRATEGIES),
+        "all_kbs": all_kbs,
+        "kb_groups": groups,
+        "effective_kbs": effective,
+    }
+
+
+@router.put("/{partner_id}/config")
+async def put_partner_config(partner_id: str, payload: PartnerConfigUpdate):
+    """Update partner config (currently kb_strategy only)."""
+    mgr = get_partner_manager()
+    if not mgr.partner_exists(partner_id):
+        raise HTTPException(status_code=404, detail=t("api.partner_not_found"))
+    cfg = read_partner_config(partner_id)
+    if payload.kb_strategy is not None:
+        if payload.kb_strategy not in VALID_KB_STRATEGIES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid kb_strategy. Must be one of: {list(VALID_KB_STRATEGIES)}",
+            )
+        cfg["kb_strategy"] = payload.kb_strategy
+    write_partner_config(partner_id, cfg)
+    return {"partner_id": partner_id, "config": cfg, "saved": True}
+
+
 # ── Assets ─────────────────────────────────────────────────────
 
 
@@ -818,6 +884,61 @@ def _resolve_http_session(payload: ChatMessageRequest) -> tuple[str, str]:
     return session_id, session_id
 
 
+async def _append_sales_action(
+    ai_reply: str,
+    user_text: str,
+    external_id: str,
+) -> str:
+    """在 AI 回复末尾追加销售意向度动作文本（如直播链接）。公共入口."""
+    from deeptutor.sales.service import maybe_run_sales_intent
+    action_text = await maybe_run_sales_intent(
+        user_id=external_id,
+        user_text=user_text,
+    )
+    if action_text:
+        # 清掉 AI 回复中 RAG 可能召回的其他直播链接，确保我们的 mock/MCP 链接唯一
+        cleaned = _strip_rag_live_links(ai_reply or "")
+        return cleaned.rstrip() + action_text
+    return ai_reply
+
+
+# RAG 召回中可能混入的直播相关 URL 关键词（全部小写匹配）
+_RAG_LIVE_LINK_HINTS = (
+    "shirleyclass", "live.", "直播课.*https?://",
+)
+
+import re as _re
+_URL_RE = _re.compile(
+    r'https?://[^\s，。,.;；!！?？\)）】\]\}>"' + "'" + r']+',
+    _re.IGNORECASE,
+)
+
+
+def _strip_rag_live_links(text: str) -> str:
+    """移除 AI 回复中疑似直播相关的 URL，避免和我们的 mock/MCP 链接重复.
+
+    策略: 只移除 URL 里包含直播/课程关键词的，普通资源链接（如文档、视频）不动。
+    """
+    if not text:
+        return text
+
+    def _is_live_url(url: str) -> bool:
+        lower = url.lower()
+        return any(hint in lower for hint in _RAG_LIVE_LINK_HINTS)
+
+    def _replace(match: _re.Match) -> str:
+        url = match.group(0)
+        if _is_live_url(url):
+            return ""  # 删掉 URL，后续 rstrip 清理尾部标点
+        return url
+
+    result = _URL_RE.sub(_replace, text)
+    # 清理 URL 被删掉后遗留的 " ，。, ." 等尾巴
+    result = _re.sub(r"\s+[，。,；;！!？?]+\s*", " ", result)
+    result = _re.sub(r"\s{2,}", " ", result)
+    return result.strip()
+
+
 # Fallback caps when the settings layer is unavailable; the effective values
 # come from the shared chat-attachment policy (data/user/settings/system.json,
 # editable at /settings/attachments).
@@ -901,6 +1022,34 @@ async def partner_chat_http(partner_id: str, payload: ChatMessageRequest) -> dic
         content = _default_attachment_prompt(payload.attachments)
     mgr = get_partner_manager()
     session_id, chat_id = _resolve_http_session(payload)
+
+    captured_sources: list[dict[str, Any]] = []
+
+    async def _capture_sources(ev: Any) -> None:
+        try:
+            ev_type = ev.type.value if hasattr(ev.type, "value") else str(getattr(ev, "type", ""))
+        except Exception:
+            return
+        if ev_type != "sources":
+            return
+        meta = getattr(ev, "metadata", None) or {}
+        items = meta.get("sources") if isinstance(meta, dict) else None
+        if not items:
+            return
+        for src in items:
+            if not isinstance(src, dict):
+                continue
+            captured_sources.append({
+                "type": str(src.get("type", "")),
+                "kb_name": str(src.get("kb_name", "")),
+                "title": str(src.get("title") or ""),
+                "source": str(src.get("source") or src.get("filename") or ""),
+                "page": src.get("page"),
+                "score": src.get("score"),
+                "chunk_id": str(src.get("chunk_id") or ""),
+            })
+
+    t0 = time.perf_counter()
     try:
         response = await mgr.send_message(
             partner_id,
@@ -909,13 +1058,36 @@ async def partner_chat_http(partner_id: str, payload: ChatMessageRequest) -> dic
             session_id=session_id,
             media=media_paths,
             session_key=payload.session_key,
+            on_event=_capture_sources,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
+    elapsed_ms = int((time.perf_counter() - t0) * 1000)
+
+    # ── sales intent (可选功能，缺依赖时静默降级) ──
+    try:
+        response = await _append_sales_action(
+            response, user_text=content,
+            external_id=payload.session_key or f"rest_{partner_id}_{session_id}",
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+    # 按 (kb_name, title, source, chunk_id) 组合键去重
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for s in captured_sources:
+        key = "|".join([s["kb_name"], s["title"], s["source"], s["chunk_id"]])
+        if key not in seen:
+            seen.add(key)
+            deduped.append(s)
+
     return {
         "partner_id": partner_id,
         "session_id": session_id,
         "content": response,
+        "elapsed_ms": elapsed_ms,
+        "sources": deduped,
     }
 
 
@@ -923,7 +1095,7 @@ async def _partner_chat_stream(
     partner_id: str,
     payload: ChatMessageRequest,
 ) -> AsyncGenerator[str, None]:
-    from deeptutor.core.stream import StreamEventType
+    """完整回复后 → 分句 → 逐句打字机推送（与 ws_v2 同逻辑）。"""
 
     mgr = get_partner_manager()
     content = payload.content.strip()
@@ -934,50 +1106,43 @@ async def _partner_chat_stream(
     if not content and media_paths:
         content = _default_attachment_prompt(payload.attachments)
     session_id, chat_id = _resolve_http_session(payload)
-    queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-    done = asyncio.Event()
-    holder: dict[str, Any] = {}
-
-    async def on_event(event: Any) -> None:
-        if event.type == StreamEventType.THINKING and event.content:
-            await queue.put({"event": "thinking", "payload": {"content": event.content}})
-
-    async def run() -> None:
-        try:
-            holder["content"] = await mgr.send_message(
-                partner_id,
-                content,
-                chat_id=chat_id,
-                session_id=session_id,
-                media=media_paths,
-                on_event=on_event,
-                session_key=payload.session_key,
-            )
-        except Exception as exc:  # noqa: BLE001
-            holder["error"] = str(exc)
-        finally:
-            done.set()
 
     yield _sse("session", {"partner_id": partner_id, "session_id": session_id})
-    task = asyncio.create_task(run())
+
     try:
-        while not done.is_set():
-            try:
-                item = await asyncio.wait_for(queue.get(), timeout=0.15)
-            except asyncio.TimeoutError:
-                continue
-            yield _sse(item["event"], item["payload"])
-        while not queue.empty():
-            item = queue.get_nowait()
-            yield _sse(item["event"], item["payload"])
-        if holder.get("error"):
-            yield _sse("error", {"detail": holder["error"]})
-            return
-        yield _sse("content", {"content": holder.get("content", "")})
+        full_text = await mgr.send_message(
+            partner_id,
+            content,
+            chat_id=chat_id,
+            session_id=session_id,
+            media=media_paths,
+            session_key=payload.session_key,
+        )
+    except Exception as exc:  # noqa: BLE001
+        yield _sse("error", {"detail": str(exc)})
+        return
+
+    try:
+        final_content = await _append_sales_action(
+            (full_text or "").strip(), user_text=content,
+            external_id=payload.session_key or f"rest_{partner_id}_{session_id}",
+        )
+    except Exception:  # noqa: BLE001 — 销售意向是可选功能，缺依赖时静默跳过
+        final_content = (full_text or "").strip()
+    final_content = (final_content or "").strip()
+
+    if not final_content:
+        yield _sse("content", {"content": ""})
         yield _sse("done", {"partner_id": partner_id, "session_id": session_id})
-    finally:
-        if not task.done():
-            task.cancel()
+        return
+
+    sentences = split_sentences(final_content) or [final_content]
+    delay = TypingDelay()
+    for s in sentences:
+        yield _sse("content", {"content": s})
+        await asyncio.sleep(delay.for_sentence(s))
+
+    yield _sse("done", {"partner_id": partner_id, "session_id": session_id})
 
 
 @router.post("/{partner_id}/chat/execute-stream")
