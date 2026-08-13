@@ -1,0 +1,72 @@
+# ============================================
+# AI Sales Customer Service — Postgres Stack
+# ============================================
+# Internal sales CRM + AI customer service database.
+# Standalone file: bring up just the DB without the DeepTutor app.
+#
+# Usage:
+#   docker compose -f docker-compose.sales.yml --env-file .env.sales up -d
+#   docker compose -f docker-compose.sales.yml down            # stop only
+#   docker compose -f docker-compose.sales.yml down -v          # wipe data too
+#
+# First-time bootstrap: Postgres auto-runs scripts/sql/*.sql in
+# alphabetical order via docker-entrypoint-initdb.d.  Subsequent
+# starts skip init — use `down -v` to re-init or run scripts manually.
+# ============================================
+
+name: sales-crm
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: sales-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${PG_USER:-sales}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-sales_dev_2026}
+      POSTGRES_DB: ${PG_DATABASE:-sales_crm}
+      TZ: ${PG_TZ:-Asia/Shanghai}
+    ports:
+      - "${PG_PORT:-5432}:5432"
+    volumes:
+      - sales_pg_data:/var/lib/postgresql/data
+      # Init scripts run ONCE on first creation only
+      - ./scripts/sql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER:-sales} -d ${PG_DATABASE:-sales_crm}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks:
+      - sales-network
+
+  # ----- Optional admin UI -----
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: sales-pgadmin
+    restart: unless-stopped
+    profiles: ["admin"]
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@sales.local}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin_dev_2026}
+      TZ: ${PG_TZ:-Asia/Shanghai}
+    ports:
+      - "${PGADMIN_PORT:-5050}:80"
+    volumes:
+      - sales_pgadmin_data:/var/lib/pgadmin
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - sales-network
+
+volumes:
+  sales_pg_data:
+    name: sales_pg_data
+  sales_pgadmin_data:
+    name: sales_pgadmin_data
+
+networks:
+  sales-network:
+    driver: bridge
