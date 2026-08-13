@@ -1,5 +1,5 @@
 """
-顶层编排：一条客户消息进来 → 正则打标签 → 算 delivery_q_count → 算温度 → 算动作 → 写回 DB → 返回要追加的动作文本.
+顶层编排：一条客户消息进来 → LLM打标 → 正则兜底 → 算 delivery_q_count → 算温度 → 算动作 → 写回 DB → 返回要追加的动作文本.
 
 所有纯逻辑都在 tagger / temperature / actions 里，这个文件是胶水。
 """
@@ -13,6 +13,7 @@ from .schemas import CustomerProfile
 from .tagger import (
     regex_tag, regex_profile_extract,
     merge_signals, merge_profile, compute_delivery_count,
+    llm_tag,
 )
 from .temperature import apply_temperature_to_profile
 from .actions import build_action_builder
@@ -27,14 +28,14 @@ async def process_customer_message(
     channel: str = "wecom",
     nickname: str | None = None,
     llm_client: Any = None,
-    force_llm: bool = False,
+    force_regex: bool = False,
 ) -> tuple[CustomerProfile, str | None]:
     """处理一条客户消息。返回 (更新后的 profile, 要追加到 AI 回复的动作文本或 None).
 
     流程:
       1. upsert customer → 拿已有 profile
-      2. 正则打标签（快路径，0 LLM 调用）
-      3. 如果正则全 miss 或 force_llm → LLM 兜底
+      2. LLM 打标签（优先，有 llm_client 就调）
+      3. 正则兜底（LLM 失败/全空 或 force_regex=True 时触发，补 LLM 没覆盖到的标签）
       4. 合并 signals + profile + 算 delivery_q_count
       5. 算温度档 + 时间窗 + 止损
       6. 算 next_action → 可能生成直播推送文本
@@ -57,27 +58,38 @@ async def process_customer_message(
     first_seen_at = cust_row.get("first_seen_at")
     last_active_at = cust_row.get("last_active_at")
 
-    # 2. 正则打标签
-    new_signals, new_source = regex_tag(customer_msg)
-    new_profile_data = regex_profile_extract(customer_msg)
+    new_signals: dict[str, bool] = {}
+    new_source: dict[str, str] = {}
+    new_profile_data: dict[str, Any] = {}
 
-    # 3. LLM 兜底（正则命中 < 2 个且没有标记任何关键信号 → 可能是模糊表述）
-    need_llm = (not new_signals) or force_llm
-    if need_llm and llm_client is not None:
+    # 2. LLM 打标（优先）
+    llm_ok = False
+    if llm_client is not None and not force_regex:
         try:
-            from .tagger import llm_tag
             llm_sig, llm_src, llm_prof = await llm_tag(customer_msg, llm_client)
-            # LLM 和正则结果合并：正则命中的保留 regex 源，LLM 新增的标记为 llm
+            # LLM 命中的直接装进去，source = "llm"
             for label, val in llm_sig.items():
-                if val and not new_signals.get(label):
+                if val:
                     new_signals[label] = True
                     new_source[label] = llm_src.get(label, "llm")
-            # B 组画像只在正则没抽到的时候用 LLM
+            # B 组画像有值就填
             for k, v in llm_prof.items():
-                if v and not new_profile_data.get(k):
+                if v is not None and v != "" and v != []:
                     new_profile_data[k] = v
+            llm_ok = True
         except Exception as exc:
-            logger.warning("LLM tag fallback skipped: %s", exc)
+            logger.warning("LLM tag failed, falling back to regex: %s", exc)
+
+    # 3. 正则补漏（无论 LLM 有没有命中都跑，只补 LLM 没覆盖到的标签）
+    reg_sig, reg_src = regex_tag(customer_msg)
+    reg_prof = regex_profile_extract(customer_msg)
+    for label, val in reg_sig.items():
+        if val and not new_signals.get(label):
+            new_signals[label] = True
+            new_source[label] = reg_src.get(label, "regex")
+    for k, v in reg_prof.items():
+        if v and not new_profile_data.get(k):
+            new_profile_data[k] = v
 
     # 4. 合并 + 算 delivery_q_count + 对话轮次累加
     merge_signals(profile, new_signals, new_source)
