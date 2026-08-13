@@ -801,6 +801,8 @@ class PartnerManager:
         media: list[str] | None = None,
         on_event: Callable[[Any], Awaitable[None]] | None = None,
         session_key: str | None = None,
+        corpid: str | None = None,
+        external_userid: str | None = None,
     ) -> str:
         """Send a web message to a running partner and return the reply.
 
@@ -825,6 +827,7 @@ class PartnerManager:
             chat_id=session_id or chat_id,
             content=content,
             media=media or [],
+            metadata={"corpid": corpid or "", "external_userid": external_userid or ""},
             session_key_override=resolved_key,
         )
         return await instance.runner.process_message(msg, on_event=on_event)

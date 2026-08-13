@@ -148,6 +148,19 @@ class PartnerRunner:
         when the reply was already delivered live via stream deltas).
         """
         session_key = msg.session_key
+        msg.metadata = msg.metadata or {}
+        corpid = msg.metadata.get("corpid") or ""
+        ext_userid = msg.metadata.get("external_userid") or ""
+        if corpid and ext_userid:
+            try:
+                from deeptutor.services import shirley_profile
+
+                profile = await shirley_profile.fetch_profile(corpid, ext_userid)
+                summary = shirley_profile.summarize_profile(profile)
+                if summary:
+                    msg.metadata.setdefault("_profile_summary", "\n\n" + summary)
+            except Exception as e:
+                logger.warning("Shirley profile fetch failed: %s", e)
         async with self._lock_for(session_key):
             command = PartnerCommandHandler(
                 partner_id=self.partner_id,
@@ -177,6 +190,30 @@ class PartnerRunner:
                     channel=msg.channel,
                     events=turn_events or None,
                 )
+            if final and corpid and ext_userid:
+                try:
+                    from deeptutor.services import shirley_profile
+
+                    hits = shirley_profile.should_trigger_analysis(msg.content)
+                    if hits:
+                        history = self.store.conversation_history(session_key)
+                        profile = (
+                            await shirley_profile.fetch_profile(corpid, ext_userid) or {}
+                        )
+                        prev_ai = profile.get("aiAnalysis") if isinstance(profile, dict) else None
+                        analysis = await shirley_profile.analyze_from_dialogue(
+                            history, msg.content, prev_ai
+                        )
+                        if analysis:
+                            await shirley_profile.save_analysis(corpid, ext_userid, analysis)
+                            logger.info(
+                                "Shirley profile analysis saved for %s/%s, keys=%s",
+                                corpid,
+                                ext_userid,
+                                list(analysis.keys()),
+                            )
+                except Exception as e:
+                    logger.warning("Shirley profile analysis failed: %s", e)
             return final
 
     async def _run_turn(
@@ -430,7 +467,8 @@ class PartnerRunner:
             knowledge_bases=kb_names,
             attachments=attachments,
             language=self._language(),
-            persona_context=read_soul(self.partner_id).strip(),
+            persona_context=read_soul(self.partner_id).strip()
+            + ((msg.metadata or {}).get("_profile_summary") or ""),
             skills_manifest=skills_manifest,
             source_manifest=source_manifest,
             metadata=metadata,

@@ -197,6 +197,8 @@ class ChatMessageRequest(BaseModel):
     chat_id: str | None = None
     attachments: list[ChatAttachmentRequest] = Field(default_factory=list)
     llm_selection: dict[str, str] | None = Field(default=None, alias="llmSelection")
+    corpid: str | None = None
+    external_userid: str | None = None
 
 
 class SessionKeyBody(BaseModel):
@@ -1059,6 +1061,8 @@ async def partner_chat_http(partner_id: str, payload: ChatMessageRequest) -> dic
             media=media_paths,
             session_key=payload.session_key,
             on_event=_capture_sources,
+            corpid=getattr(payload, "corpid", None),
+            external_userid=getattr(payload, "external_userid", None),
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
