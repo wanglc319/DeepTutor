@@ -16,7 +16,7 @@ from .tagger import (
     llm_tag,
 )
 from .temperature import apply_temperature_to_profile
-from .actions import build_action_builder, build_action_builder_async
+from .actions import build_action_builder
 from . import db as sales_db
 
 logger = logging.getLogger(__name__)
@@ -29,6 +29,8 @@ async def process_customer_message(
     nickname: str | None = None,
     llm_client: Any = None,
     force_regex: bool = False,
+    corpid: str | None = None,
+    qywx_userid: str | None = None,
 ) -> tuple[CustomerProfile, str | None]:
     """处理一条客户消息。返回 (更新后的 profile, 要追加到 AI 回复的动作文本或 None).
 
@@ -100,8 +102,11 @@ async def process_customer_message(
     # 5. 温度 + 时间窗
     apply_temperature_to_profile(profile, first_seen_at, last_active_at)
 
-    # 6. 动作决策（异步版优先走 MCP 拉直播链接）
-    action_text = await build_action_builder_async(profile)
+    # 6. 动作决策
+    action_text = await build_action_builder(
+        profile, corpid=corpid, external_userid=customer_external_id,
+        qywx_userid=qywx_userid,
+    )
 
     # 7. 写回 DB
     try:
@@ -135,7 +140,7 @@ def run_without_db(
     profile.customer_msg_count += 1
 
     apply_temperature_to_profile(profile, first_seen_at, last_active_at)
-    action_text = build_action_builder(profile)
+    action_text = None
 
     return profile, action_text
 

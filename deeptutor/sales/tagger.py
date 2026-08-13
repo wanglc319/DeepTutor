@@ -38,7 +38,16 @@ _REGEX_HINTS: dict[str, str] = {
     "asked_level":        r"(什么级别|程度|水平|难易|难度|入门|进阶|高级|beginner|intermediate|advanced|level)",
 
     # 明确拒绝（唯一负面标签）
-    "__refusal__": r"(不用了|算了|再想想|不急|暂时.*(不|没)|以后|先.*(不|没)|不需要|不考虑|不感兴趣|不用谢谢|拒绝|我不需要)",
+    # 只匹配真正的终止意图。保留性表述（"我再想想"/"不急"/"以后再说"）不算拒绝,
+    # 与 llm_tag 的提示词口径保持一致。
+    # 注意不能用 `先.*(不|没)` / 裸 `以后` 这类宽泛模式:
+    #   "能不能先安排个试听看看孩子适不适应" 会被误判成拒绝（实际是高意向）
+    "__refusal__": (
+        r"(不用了|不用谢谢|算了|不需要|不考虑|不感兴趣|没兴趣|没有兴趣"
+        r"|别再(发|推|打扰)|别发了|不要(再)?(发|推|联系)"
+        r"|退了|退课|退款|取消(报名|订单)"
+        r"|拒绝)"
+    ),
 
     # ── B 组（画像） ──
     "grade":              r"(几年级|年级|year\s*\d|primary|junior|senior|grade\s*\d)",
@@ -225,10 +234,21 @@ def merge_signals(prev: CustomerProfile, new_signals: dict[str, bool], new_sourc
             prev.tag_source[label] = new_source.get(label, "unknown")
         # 已有 True 保持 True（标签一旦打上去就不撤回）
 
-    # explicit_refusal 特殊处理：refusal > 已有拒绝不丢，但极热档会覆盖它的效果
+    # explicit_refusal 特殊处理：可置位，也必须可复位。
+    # 之前只置 True 不复位，导致一次误判后该客户永久走拒绝分支（LLM 再也不被调用）。
     if new_signals.get("explicit_refusal"):
         prev.explicit_refusal = True
         prev.tag_source["explicit_refusal"] = new_source.get("explicit_refusal", "unknown")
+    elif prev.explicit_refusal and _has_positive_intent(new_signals):
+        # 本条消息没有拒绝意图，且带明确正向意向 → 客户回心转意，解除拒绝
+        prev.explicit_refusal = False
+        prev.intent_signals.pop("explicit_refusal", None)
+        prev.tag_source.pop("explicit_refusal", None)
+
+
+def _has_positive_intent(new_signals: dict[str, bool]) -> bool:
+    """本条消息是否带明确正向意向（用于解除历史 refusal 状态）。"""
+    return any(new_signals.get(label) for label in A_GROUP_SIGNALS)
 
 
 def merge_profile(prev: CustomerProfile, new_profile: dict[str, Any]) -> None:

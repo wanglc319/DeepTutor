@@ -25,12 +25,56 @@ from typing import Final
 _HARD_TERMINATORS: Final = set("。！？.!?")
 _SOFT_TERMINATORS: Final = set("，,")
 _EMOJI_OR_MENTION_RE = re.compile(
-    r"[\U0001F300-\U0001FAFF\u2600-\u27BF]|@\w+"
+    r"[\U0001F300-\U0001FAFF☀-✿]|@\w+"
 )
+
+# URL 必须先抽成占位符再分句: 链接里的 ? ! . / 都会被当终止符或硬切,
+# 导致直播链接被截断。占位符在分句全程保持原子性, 最后还原。
+_URL_RE = re.compile(r"https?://[^\s，,。！？；；））\]]+")
+_URL_PLACEHOLDER = "⟦URL{idx}⟧"
+_URL_PLACEHOLDER_RE = re.compile(r"⟦URL(\d+)⟧")
+
+# 含链接的整行 (如直播推送 "第125期 【第一课】规划！...：https://...")
+# 要作为一条完整消息推送, 标题里的 ！! ， 不能触发分句。
+# 所以把"含 URL 占位符的整行"再抽成行级占位符, 分句全程不碰。
+_LINE_PLACEHOLDER = "⟦LINE{idx}⟧"
+_LINE_PLACEHOLDER_RE = re.compile(r"⟦LINE(\d+)⟧")
+# 硬切时同时保护 URL / LINE 两类占位符, 都不被拦腰切断
+_ANY_PLACEHOLDER_RE = re.compile(r"⟦(?:URL|LINE)\d+⟧")
 
 _MAX_CHARS_PER_SENTENCE: Final = 40
 _MIN_CHARS_PER_SENTENCE: Final = 3
 _IDEAL_CHARS: Final = 18
+
+
+def _hard_cut_keep_urls(part: str) -> list[str]:
+    """超长片段按字数硬切, 但 URL/LINE 占位符永远保持原子、不被拦腰切断."""
+    segs = _ANY_PLACEHOLDER_RE.split(part)  # [text0, text1, ..., textN]
+    phs = _ANY_PLACEHOLDER_RE.findall(part)  # [ph0, ph1, ..., phN-1]
+    pieces: list[str] = []
+    current = ""
+    for i, text_seg in enumerate(segs):
+        # 纯文本部分先按 _IDEAL_CHARS 切段
+        while len(current) + len(text_seg) > _IDEAL_CHARS and text_seg:
+            take = _IDEAL_CHARS - len(current)
+            if take <= 0:
+                pieces.append(current)
+                current = ""
+                take = _IDEAL_CHARS
+            current += text_seg[:take]
+            text_seg = text_seg[take:]
+            if len(current) >= _IDEAL_CHARS:
+                pieces.append(current)
+                current = ""
+        current += text_seg
+        # 占位符(完整 URL / 含链接整行)拼进当前句, 且当前句到此为止收口
+        if i < len(phs):
+            current += phs[i]
+            pieces.append(current)
+            current = ""
+    if current.strip():
+        pieces.append(current)
+    return [p.strip() for p in pieces if p.strip()]
 
 
 def split_sentences(text: str) -> list[str]:
@@ -52,7 +96,28 @@ def split_sentences(text: str) -> list[str]:
     if not text or not text.strip():
         return []
 
+    # 第一步: 把所有 URL 抽成原子占位符, 分句全程不碰链接
+    urls: list[str] = []
+
+    def _stash(m: re.Match[str]) -> str:
+        urls.append(m.group(0))
+        return _URL_PLACEHOLDER.format(idx=len(urls) - 1)
+
+    text = _URL_RE.sub(_stash, text)
     text = re.sub(r"[ \t]+", " ", text.strip())
+
+    # 第二步: 含 URL 占位符的整行抽成行级占位符 ——
+    # 直播推送 "第125期 【第一课】规划！...：⟦URL0⟧" 要整行作为一条消息,
+    # 标题里的 ！! ， 不能触发分句。
+    lines: list[str] = []
+
+    def _stash_line(line: str) -> str:
+        if _URL_PLACEHOLDER_RE.search(line):
+            lines.append(line)
+            return _LINE_PLACEHOLDER.format(idx=len(lines) - 1)
+        return line
+
+    text = "\n".join(_stash_line(ln) for ln in text.split("\n"))
 
     raw_parts: list[str] = []
     buffer = ""
@@ -74,13 +139,13 @@ def split_sentences(text: str) -> list[str]:
 
     result: list[str] = []
     for part in raw_parts:
-        if len(part) <= _MAX_CHARS_PER_SENTENCE:
+        # 整行占位符(含链接行)无论多长都保持完整, 不进硬切
+        if _LINE_PLACEHOLDER_RE.fullmatch(part.strip()):
+            result.append(part.strip())
+        elif len(part) <= _MAX_CHARS_PER_SENTENCE:
             result.append(part)
         else:
-            for i in range(0, len(part), _IDEAL_CHARS):
-                piece = part[i : i + _IDEAL_CHARS].strip()
-                if piece:
-                    result.append(piece)
+            result.extend(_hard_cut_keep_urls(part))
 
     merged: list[str] = []
     for chunk in result:
@@ -88,12 +153,28 @@ def split_sentences(text: str) -> list[str]:
             merged
             and len(chunk) < _MIN_CHARS_PER_SENTENCE
             and len(merged[-1]) + len(chunk) <= _MAX_CHARS_PER_SENTENCE
+            and not _LINE_PLACEHOLDER_RE.search(chunk)
+            and not _LINE_PLACEHOLDER_RE.search(merged[-1])
         ):
             merged[-1] += chunk
         else:
             merged.append(chunk)
 
-    return merged
+    # 还原: 先行级占位符(内含 URL 占位符), 再还原 URL → 完整链接
+    def _restore_line(m: re.Match[str]) -> str:
+        idx = int(m.group(1))
+        return lines[idx] if idx < len(lines) else ""
+
+    def _restore_url(m: re.Match[str]) -> str:
+        idx = int(m.group(1))
+        return urls[idx] if idx < len(urls) else ""
+
+    out: list[str] = []
+    for chunk in merged:
+        chunk = _LINE_PLACEHOLDER_RE.sub(_restore_line, chunk)
+        chunk = _URL_PLACEHOLDER_RE.sub(_restore_url, chunk)
+        out.append(chunk)
+    return out
 
 
 # ── Typing delay ──────────────────────────────────────────────────────

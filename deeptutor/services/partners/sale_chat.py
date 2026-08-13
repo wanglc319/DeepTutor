@@ -1,0 +1,999 @@
+"""
+Sale Chat Service
+=================
+
+给 Lisa 销售侧用的专用聊天入口。与通用 partner/chat 不同:
+
+  1. 每个 session_id 独立维护一个 10s 抖动窗口 (debounce)
+  2. 窗口内聚合所有用户消息 → 触发业务逻辑
+  3. 业务链路: fetch_profile(5.1) → fetch_history(5.2)
+     → sales_service(打标签+温度档+拒绝判定+next_action)
+     → 拒绝? push_reject(6 msgType=119) : llm_reply(画像注入) → push_sentences
+     → analyze_and_save(5.3) 同步回写画像
+  4. 正常回复: 分句 → 逐句调 Shirley MCP reply_lisa_message
+  5. 拒绝回复: 直接调 reply_lisa_message(msgType=119, answer=拒绝原因)
+  6. 全部推送完清空窗口
+
+架构:
+  进程内 dict[session_id, _DebounceSlot] 维护状态
+  asyncio.Lock 保护 per-session 并发安全
+  asyncio.create_task 启动抖动定时器 + 触发处理
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import re
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
+from deeptutor.services.partners.sentence_split import TypingDelay, split_sentences
+from deeptutor.services.shirley import qywx
+
+logger = logging.getLogger(__name__)
+
+DEBOUNCE_SECONDS = 10.0
+TYPING_BASE_DELAY = 0.3
+TYPING_PER_CHAR = 0.04
+
+# 动态 soul 的 partner_id: 从 data/partners/<id>/workspace/user/workspace/SOUL.md 读取
+# 后台改完 SOUL.md 下一轮对话立即生效, 无需重启
+SOUL_PARTNER_ID = "lisa"
+
+
+@dataclass
+class _DebounceSlot:
+    """一个 session 的抖动窗口状态。"""
+
+    messages: list[dict[str, Any]] = field(default_factory=list)
+    last_event_ts: float = 0.0
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    timer_task: asyncio.Task | None = None
+    prime_info: dict[str, Any] = field(default_factory=dict)
+    corpid: str = ""
+    external_userid: str = ""
+
+
+_slots: dict[str, _DebounceSlot] = {}
+_slots_lock = asyncio.Lock()
+
+
+async def enqueue(
+    session_id: str,
+    message: dict[str, Any],
+    *,
+    corpid: str,
+    external_userid: str,
+    prime_info: dict[str, Any],
+) -> None:
+    """把一条消息塞进 session 的 debounce 窗口。触发 / 重置定时器。"""
+    if not session_id:
+        logger.warning("[sale_chat.enqueue] session_id 为空，丢弃")
+        return
+
+    content = (message or {}).get("content", "")
+    slot = await _get_or_create_slot(session_id)
+
+    async with slot.lock:
+        slot.messages.append(message)
+        slot.last_event_ts = time.time()
+        slot.corpid = corpid
+        slot.external_userid = external_userid
+        slot.prime_info = prime_info
+
+        was_running = bool(slot.timer_task and not slot.timer_task.done())
+        if was_running:
+            slot.timer_task.cancel()
+
+        slot.timer_task = asyncio.create_task(
+            _debounce_timer(session_id, DEBOUNCE_SECONDS)
+        )
+
+    logger.info(
+        "[sale_chat.enqueue] session=%s | msg_len=%d | aggregate_count=%d | timer=%s | corpid=%s | ext=%s",
+        session_id, len(content), len(slot.messages),
+        "reset" if was_running else "new", corpid, external_userid,
+    )
+
+
+async def _get_or_create_slot(session_id: str) -> _DebounceSlot:
+    async with _slots_lock:
+        slot = _slots.get(session_id)
+        if slot is None:
+            slot = _DebounceSlot()
+            _slots[session_id] = slot
+        return slot
+
+
+async def _debounce_timer(session_id: str, delay: float) -> None:
+    t0 = time.perf_counter()
+    logger.debug("[sale_chat.debounce] session=%s timer_start delay=%.1fs", session_id, delay)
+    try:
+        await asyncio.sleep(delay)
+    except asyncio.CancelledError:
+        logger.debug("[sale_chat.debounce] session=%s timer_cancelled after %.1fs", session_id, time.perf_counter() - t0)
+        return
+
+    slot = _slots.get(session_id)
+    if slot is None:
+        return
+
+    async with slot.lock:
+        if not slot.messages:
+            return
+        messages_to_process = list(slot.messages)
+        slot.messages.clear()
+        slot.timer_task = None
+        corpid = slot.corpid
+        external_userid = slot.external_userid
+        prime_info = dict(slot.prime_info)
+
+    elapsed = time.perf_counter() - t0
+    logger.info(
+        "[sale_chat.debounce] session=%s TRIGGERED after %.1fs | aggregated_msgs=%d",
+        session_id, elapsed, len(messages_to_process),
+    )
+
+    asyncio.create_task(
+        _process_session(
+            session_id=session_id,
+            messages=messages_to_process,
+            corpid=corpid,
+            external_userid=external_userid,
+            prime_info=prime_info,
+        )
+    )
+
+
+# ── Shirley 画像拉取 / 写回 辅助 ──
+
+async def _fetch_profile_summary(corpid: str, external_userid: str) -> str:
+    """调 Shirley 5.1 get_user_profile → summarize_profile 压缩成摘要注入 system prompt."""
+    try:
+        from deeptutor.services.shirley import profile as shirley_profile
+        t0 = time.perf_counter()
+        raw = await shirley_profile.fetch_profile(corpid, external_userid)
+        summary = shirley_profile.summarize_profile(raw)
+        logger.info(
+            "[sale_chat.fetch_profile] elapsed_ms=%d | has_profile=%s | summary_len=%d",
+            int((time.perf_counter() - t0) * 1000), bool(raw), len(summary),
+        )
+        return summary
+    except Exception as e:
+        logger.warning("[sale_chat.fetch_profile] failed: %s", e)
+        return ""
+
+
+async def _analyze_and_save_profile(
+    *,
+    corpid: str,
+    external_userid: str,
+    history: list[dict[str, Any]],
+    user_text: str,
+    intent_level: str | None,
+) -> None:
+    """调 Shirley 5.3 把本轮 sales service 判定的画像结果同步回写."""
+    try:
+        from deeptutor.services.shirley import profile as shirley_profile
+        t0 = time.perf_counter()
+        res = await shirley_profile.analyze_and_save(
+            corpid=corpid,
+            external_userid=external_userid,
+            history=history,
+            user_text=user_text,
+            intent_level=intent_level,
+        )
+        logger.info(
+            "[sale_chat.analyze_and_save] elapsed_ms=%d | intent_level=%s | ok=%s",
+            int((time.perf_counter() - t0) * 1000), intent_level, res is not None,
+        )
+    except Exception as e:
+        logger.warning("[sale_chat.analyze_and_save] failed: %s", e)
+
+
+async def _fetch_kb_context(query: str, partner_id: str = SOUL_PARTNER_ID) -> tuple[str, float]:
+    """走 qdrant 知识库检索, 把相关话术/知识片段压缩后注入 system prompt.
+
+    返回 (kb_context, max_score)。max_score 是所有 KB 召回结果中最高的
+    qdrant 相似度分数, 用于判断置信度是否足够。
+
+    与 runtime 一致: 列出 partner 绑定的 KB (kb_strategy 过滤), 逐个
+    RAGService.search, 取 content 前若干字。任何一步失败都降级为空串,
+    不阻断主链路。
+    """
+    if not (query or "").strip():
+        return "", 0.0
+    try:
+        from deeptutor.knowledge.manager import KnowledgeBaseManager
+        from deeptutor.services.partners.workspace import (
+            apply_kb_strategy,
+            read_partner_config,
+        )
+        from deeptutor.services.path_service import get_path_service
+        from deeptutor.services.rag.service import RAGService
+
+        kb_root = get_path_service().get_knowledge_bases_root()
+        if not kb_root.is_dir():
+            logger.info("[sale_chat.kb] no kb_root dir, skip retrieval")
+            return "", 0.0
+        kb_names = apply_kb_strategy(
+            KnowledgeBaseManager(base_dir=str(kb_root)).list_knowledge_bases(),
+            read_partner_config(partner_id).get("kb_strategy", "equal_weight"),
+        )
+        if not kb_names:
+            logger.info("[sale_chat.kb] no KBs bound, skip retrieval")
+            return "", 0.0
+
+        svc = RAGService(kb_base_dir=str(kb_root))
+        snippets: list[str] = []
+        max_score: float = 0.0
+        for kb in kb_names[:3]:
+            try:
+                t0 = time.perf_counter()
+                res = await svc.search(query=query[:200], kb_name=kb)
+                content = str(res.get("content") or res.get("answer") or "").strip()
+                # 提取 sources 里的 score
+                sources = res.get("sources") or []
+                for src in sources:
+                    if isinstance(src, dict):
+                        sc = src.get("score")
+                        if isinstance(sc, (int, float)) and sc > max_score:
+                            max_score = float(sc)
+                logger.info(
+                    "[sale_chat.kb ←✓] kb=%s | elapsed_ms=%d | content_chars=%d | max_score=%.4f",
+                    kb, int((time.perf_counter() - t0) * 1000), len(content), max_score,
+                )
+                if content:
+                    snippets.append(f"【{kb}】{content[:1200]}")
+            except Exception as e:
+                logger.warning("[sale_chat.kb ←✗] kb=%s | FAILED=%s", kb, e)
+        if not snippets:
+            return "", max_score
+        return "\n\n".join(snippets)[:3000], max_score
+    except Exception as e:
+        logger.warning("[sale_chat.kb] retrieval failed, degrade to empty: %s", e)
+        return "", 0.0
+
+
+async def _fetch_history(
+    corpid: str, external_userid: str, session_id: str, limit: int = 6
+) -> list[dict[str, str]]:
+    try:
+        from deeptutor.services.shirley import profile as shirley_profile
+        history = await shirley_profile.query_chat_history(
+            corpid, external_userid, limit=limit * 2, offset=0
+        )
+        if isinstance(history, dict):
+            messages = [m for m in (history.get("messages") or []) if isinstance(m, dict)]
+
+            # Shirley 5.2 返回的是倒序（最新在前）, 必须转成正序时间线,
+            # 否则 LLM 会看到倒放的对话, 答非所问
+            def _sort_key(m: dict[str, Any]) -> str:
+                return str(m.get("createdAt") or m.get("sendTime") or "")
+
+            if messages and any(_sort_key(m) for m in messages):
+                messages.sort(key=_sort_key)
+
+            result: list[dict[str, str]] = []
+            for m in messages[-limit * 2:]:
+                content = str(m.get("content") or m.get("text") or "")
+                if not content:
+                    continue
+                # 历史里可能残留之前误推的工具调用碎片, 清洗掉再喂给 LLM
+                content = _strip_tool_calls(content)
+                if not content:
+                    continue
+                role = str(m.get("role") or m.get("type") or "")
+                if role not in ("user", "assistant"):
+                    # senderType: 0=销售/Lisa(assistant), 1=客户(user)
+                    st = m.get("senderType")
+                    role = "assistant" if st == 0 else "user" if st == 1 else ""
+                if role and content:
+                    result.append({"role": role, "content": content})
+            if result:
+                logger.info(
+                    "[sale_chat._fetch_history] turns=%d | first=%s… | last=%s…",
+                    len(result), result[0]["content"][:20], result[-1]["content"][:20],
+                )
+                return result
+    except Exception as e:
+        logger.warning("[sale_chat._fetch_history] Shirley 5.2 failed, degrade to empty: %s", e)
+
+    try:
+        from deeptutor.services.partners import get_partner_manager  # noqa: F401
+    except Exception:
+        pass
+
+    return []
+
+
+# ── 主处理链路 ──
+
+_MEDIA_URL_RE = re.compile(r"^https?://\S+$")
+
+
+def _humanize_aggregated(text: str) -> str:
+    """把纯媒体消息（空 content / 裸图片链接）转成 LLM 能理解的描述。
+
+    真实图片消息 content 往往是 "" 或一个 mmecoa 链接, 模型对着裸链接
+    会返回空。转成 "[客户发了一张图片]" 后模型才知道该怎么接话。
+    """
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    if not lines:
+        return "[客户发了一张图片或语音]"
+    out: list[str] = []
+    for ln in lines:
+        if _MEDIA_URL_RE.match(ln):
+            out.append("[客户发了一张图片]")
+        else:
+            out.append(ln)
+    return "\n".join(out)
+
+
+def _collect_image_urls(messages: list[dict[str, Any]]) -> list[str]:
+    """从聚合消息里挑出 msgType=101 的图片 URL。"""
+    urls: list[str] = []
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        if m.get("msgType") != _MSG_TYPE_IMAGE:
+            continue
+        content = str(m.get("content") or "").strip()
+        if content and _MEDIA_URL_RE.match(content):
+            urls.append(content)
+    return urls
+
+
+async def _describe_images(image_urls: list[str]) -> str:
+    """用视觉模型读取图片内容, 返回一段文字描述（供 KB 检索 + LLM 回答用）。
+
+    主模型不支持 vision, 这里单独用 _VISION_MODEL 走同一网关。
+    LLM 网关无法直接下载外网图片(企微 mmecoa 链接等), 所以先本地下载
+    转 base64 data URL 再传给视觉模型。
+    任何失败都降级为空串, 不阻断主链路。
+    """
+    if not image_urls or not _VISION_MODEL:
+        return ""
+    try:
+        import base64 as _b64
+
+        import httpx
+
+        from deeptutor.services.llm import get_llm_client
+        from deeptutor.services.llm import factory as llm_factory
+
+        cfg = get_llm_client().config
+
+        # 本地下载图片 → base64 data URL (网关拉不到外网图)
+        content_parts: list[dict[str, Any]] = [
+            {
+                "type": "text",
+                "text": (
+                    "请描述这张图片的内容，重点说明：这是什么学科/科目的资料、"
+                    "是试卷/练习册/课本/手写笔记/截图中的哪一类、"
+                    "涉及哪些知识点或题目。用中文简洁描述，2-4 句。"
+                ),
+            }
+        ]
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as http:
+            for u in image_urls[:3]:
+                try:
+                    resp = await http.get(u)
+                    resp.raise_for_status()
+                    mime = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+                    if not mime.startswith("image/"):
+                        mime = "image/jpeg"
+                    data_url = f"data:{mime};base64,{_b64.b64encode(resp.content).decode('ascii')}"
+                    content_parts.append({"type": "image_url", "image_url": {"url": data_url}})
+                except Exception as dl_err:
+                    logger.warning("[sale_chat.vision] download image FAILED | url=%s | err=%s", u[:80], dl_err)
+
+        if len(content_parts) <= 1:
+            logger.warning("[sale_chat.vision] no image downloaded, skip vision")
+            return ""
+
+        messages = [{"role": "user", "content": content_parts}]
+        t0 = time.perf_counter()
+        desc = await llm_factory.complete(
+            prompt="",
+            system_prompt="你是一个图片内容识别助手，负责把图片里的学习内容转成文字描述。",
+            model=_VISION_MODEL,
+            api_key=cfg.api_key,
+            base_url=cfg.base_url,
+            binding=getattr(cfg, "binding", "openai"),
+            messages=messages,
+        )
+        desc = (desc or "").strip()
+        logger.info(
+            "[sale_chat.vision ←✓] images=%d | elapsed_ms=%d | desc_chars=%d",
+            len(image_urls), int((time.perf_counter() - t0) * 1000), len(desc),
+        )
+        return desc
+    except Exception as e:
+        logger.warning("[sale_chat.vision ←✗] images=%d | FAILED=%s", len(image_urls), e)
+        return ""
+
+
+async def _kb_can_answer(question: str, kb_context: str) -> bool:
+    """用 LLM 判断知识库召回内容能否回答用户问题（降级转人工的闸门）。
+
+    纯向量 score 阈值区分度不够（域内 0.65-0.81 vs 无关 0.61-0.65 间隙太窄），
+    所以用 LLM 做最终相关性判定。LLM 失败时放行（不误伤正常对话）。
+    """
+    if not (question or "").strip() or not (kb_context or "").strip():
+        return False
+    try:
+        from deeptutor.services.llm import get_llm_client
+        llm = get_llm_client()
+        prompt = (
+            "判断下面的【参考资料】能否回答【用户问题】。\n"
+            "只回答一个字：能 或 不能。\n\n"
+            f"【用户问题】{question[:200]}\n\n"
+            f"【参考资料】{kb_context[:1500]}"
+        )
+        reply = await llm.complete(prompt)
+        text = (reply or "").strip()
+        can = "能" in text and "不能" not in text
+        logger.info(
+            "[sale_chat.kb_judge ←✓] question=%s | can_answer=%s | reply=%s",
+            question[:40], can, text[:20],
+        )
+        return can
+    except Exception as e:
+        logger.warning("[sale_chat.kb_judge ←✗] FAILED=%s, 放行不误伤", e)
+        return True
+
+
+async def _process_session(
+    *,
+    session_id: str,
+    messages: list[dict[str, Any]],
+    corpid: str,
+    external_userid: str,
+    prime_info: dict[str, Any],
+) -> None:
+    raw_text = "\n".join(m.get("content", "") for m in messages if m.get("content")).strip()
+    aggregated_text = _humanize_aggregated(raw_text)
+
+    logger.info(
+        "[sale_chat.process] session=%s | msgs=%d | chars=%d | corpid=%s | ext=%s",
+        session_id, len(messages), len(aggregated_text), corpid, external_userid,
+    )
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug("[sale_chat.process] session=%s | aggregated_text=%s", session_id, aggregated_text[:300])
+
+    try:
+        # ⓪ 图片消息 (msgType=101): 多模态识别图片内容 → 描述注入, 供 KB 匹配 + LLM 回答
+        image_urls = _collect_image_urls(messages)
+        image_desc = ""
+        if image_urls:
+            image_desc = await _describe_images(image_urls)
+            if image_desc:
+                aggregated_text = f"{aggregated_text}\n[客户图片内容识别] {image_desc}".strip()
+                logger.info(
+                    "[sale_chat.image] session=%s | images=%d | desc_chars=%d",
+                    session_id, len(image_urls), len(image_desc),
+                )
+
+        # ① Shirley 5.1: 拉完整画像 → 压缩成摘要给 system prompt 用
+        profile_summary = await _fetch_profile_summary(corpid, external_userid)
+
+        # ② Shirley 5.2: 拉对话历史
+        t0 = time.perf_counter()
+        history = await _fetch_history(corpid, external_userid, session_id)
+        logger.info(
+            "[sale_chat.history] session=%s | elapsed_ms=%d | history_turns=%d",
+            session_id, int((time.perf_counter() - t0) * 1000), len(history),
+        )
+
+        # ②.5 qdrant 知识库检索: 话术/知识弹药注入 system prompt
+        #     图片消息优先用识别出的描述去检索, 看图片内容能否匹配知识库
+        kb_query = image_desc if image_desc else aggregated_text
+        t0 = time.perf_counter()
+        kb_context, kb_score = await _fetch_kb_context(kb_query)
+        logger.info(
+            "[sale_chat.kb] session=%s | elapsed_ms=%d | kb_chars=%d | max_score=%.4f",
+            session_id, int((time.perf_counter() - t0) * 1000), len(kb_context), kb_score,
+        )
+
+        # 是否需要知识库支撑: 问题命中产品/课程类关键词才算"需要 KB 回答"。
+        # 图片消息用 KB 做增强(匹配上就用), 但不作为降级闸门 ——
+        # 家长发作业/资料图不是"需要知识库回答的问题", LLM 看图自然接话即可。
+        kb_required = any(kw in raw_text for kw in _KB_REQUIRED_KEYWORDS)
+
+        # ③ sales.service: 打标签 + 算温度档 + 判定 explicit_refusal + next_action
+        #    这步内部会跑 LLM tagger + regex 补漏，比单独 LLM 拒绝判断更精确
+        from deeptutor.sales import service as sales_service
+        t0 = time.perf_counter()
+        try:
+            cust_profile, action_text = await sales_service.process_customer_message(
+                customer_msg=aggregated_text,
+                customer_external_id=external_userid,
+                corpid=corpid,
+                qywx_userid=str(prime_info.get("qywxUserid") or "") or None,
+            )
+            elapsed_sales = int((time.perf_counter() - t0) * 1000)
+            intent_temperature = getattr(cust_profile, "intent_temperature", "unknown")
+            explicit_refusal = bool(getattr(cust_profile, "explicit_refusal", False))
+            next_action = getattr(cust_profile, "next_action", "none")
+            refusal_reason = ""
+            if explicit_refusal:
+                sigs = getattr(cust_profile, "intent_signals", {}) or {}
+                refusal_reason = str(sigs.get("refusal_text") or "")[:200] if isinstance(sigs, dict) else ""
+                if not refusal_reason:
+                    ts = getattr(cust_profile, "tag_source", {}) or {}
+                    refusal_reason = f"explicit_refusal(source={ts.get('explicit_refusal', 'unknown')})"
+            logger.info(
+                "[sale_chat.sales] session=%s | elapsed_ms=%d | temp=%s | refusal=%s | next_action=%s | action_len=%d",
+                session_id, elapsed_sales, intent_temperature, explicit_refusal,
+                next_action, len(action_text or ""),
+            )
+
+            # ③.5 自动打企微标签: cust_profile → tag_qywx 查表 → Shirley 接口 2
+            if cust_profile is not None:
+                try:
+                    from deeptutor.sales import qywx_tags
+                    tag_ids = await qywx_tags.tag_ids_for_profile(cust_profile)
+                    await qywx_tags.apply_tags_to_customer(
+                        corpid=corpid,
+                        external_userid=external_userid,
+                        tag_ids=tag_ids,
+                    )
+                except Exception as tag_err:
+                    logger.warning("[sale_chat.tag] session=%s | FAILED=%s", session_id, tag_err)
+        except Exception as sales_err:
+            elapsed_sales = int((time.perf_counter() - t0) * 1000)
+            logger.warning(
+                "[sale_chat.sales] session=%s | elapsed_ms=%d | FAILED=%s",
+                session_id, elapsed_sales, sales_err,
+            )
+            cust_profile = None
+            action_text = ""
+            intent_temperature = None
+            explicit_refusal = False
+            refusal_reason = ""
+
+        # ④ 拒绝分支: profile.explicit_refusal → 推 msgType=119 + 写画像 → return
+        if explicit_refusal:
+            t0 = time.perf_counter()
+            try:
+                await _push_reject(
+                    corpid=corpid,
+                    external_userid=external_userid,
+                    prime_info=prime_info,
+                    reason=refusal_reason or "用户明确拒绝",
+                )
+                logger.info(
+                    "[sale_chat.reject_push] session=%s | elapsed_ms=%d | DONE",
+                    session_id, int((time.perf_counter() - t0) * 1000),
+                )
+            except Exception as push_err:
+                logger.warning("[sale_chat.reject_push] session=%s | FAILED=%s", session_id, push_err)
+
+            await _analyze_and_save_profile(
+                corpid=corpid,
+                external_userid=external_userid,
+                history=history,
+                user_text=aggregated_text,
+                intent_level=intent_temperature,
+            )
+            return
+
+        # ④.5 KB 置信度降级: 需要知识库支撑但答不上/置信度低 → 转人工 (119)
+        #     图片消息识别后 KB 匹配不上, 或产品/课程类问题 KB 召回弱, 都走人工
+        #     三段判定: score < 阈值 → 直接转人工; score >= 阈值+0.10 → 放行;
+        #     中间模糊区 → LLM 判定召回内容能否回答问题
+        kb_degraded = False
+        degrade_reason = ""
+        if kb_required:
+            if not kb_context or kb_score < _KB_CONFIDENCE_THRESHOLD:
+                kb_degraded = True
+                degrade_reason = (
+                    f"知识库无法有效回答该问题（置信度 {kb_score:.2f} < 阈值 {_KB_CONFIDENCE_THRESHOLD}），"
+                    f"已降级转人工处理。用户问题摘要：{raw_text[:80]}"
+                )
+            elif kb_score < _KB_CONFIDENCE_THRESHOLD + 0.10:
+                # 模糊区: LLM 判定召回内容能否回答
+                can_answer = await _kb_can_answer(kb_query, kb_context)
+                if not can_answer:
+                    kb_degraded = True
+                    degrade_reason = (
+                        f"知识库召回内容与用户问题不匹配（置信度 {kb_score:.2f}），"
+                        f"AI 判定无法回答，已降级转人工处理。用户问题摘要：{raw_text[:80]}"
+                    )
+        if kb_degraded:
+            logger.warning(
+                "[sale_chat.kb_degrade] session=%s | kb_required=%s | kb_score=%.4f | threshold=%.2f | → 转人工",
+                session_id, kb_required, kb_score, _KB_CONFIDENCE_THRESHOLD,
+            )
+            try:
+                await _push_reject(
+                    corpid=corpid,
+                    external_userid=external_userid,
+                    prime_info=prime_info,
+                    reason=degrade_reason,
+                )
+            except Exception as push_err:
+                logger.warning("[sale_chat.kb_degrade] push FAILED=%s", push_err)
+
+            await _analyze_and_save_profile(
+                corpid=corpid,
+                external_userid=external_userid,
+                history=history,
+                user_text=aggregated_text,
+                intent_level=intent_temperature,
+            )
+            return
+
+        # ⑤ 正常分支: LLM 回复（soul + 产品铁律 + qdrant 知识 + 画像摘要 注入）
+        t0 = time.perf_counter()
+        full_reply = await _llm_reply(
+            history, aggregated_text,
+            profile_summary=profile_summary, kb_context=kb_context,
+        )
+        logger.info(
+            "[sale_chat.llm_reply] session=%s | elapsed_ms=%d | reply_chars=%d",
+            session_id, int((time.perf_counter() - t0) * 1000), len(full_reply or ""),
+        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("[sale_chat.llm_reply] session=%s | reply=%s", session_id, (full_reply or "")[:400])
+
+        # ⑥ 追加 sales service 的 action_text（直播链接等）
+        final_reply = (full_reply or "").strip()
+        if action_text:
+            final_reply += action_text
+            logger.info(
+                "[sale_chat.sales_action] session=%s | appended %d chars",
+                session_id, len(action_text),
+            )
+
+        # ⑥.5 兜底: LLM 挂了也必须推一句, 保证 reply_lisa_message 一定被调用
+        if not final_reply:
+            final_reply = _FALLBACK_REPLY
+            logger.warning(
+                "[sale_chat.fallback] session=%s | LLM returned empty, using fallback reply",
+                session_id,
+            )
+
+        # ⑦ 逐句推送
+        t0 = time.perf_counter()
+        await _push_sentences(
+            corpid=corpid,
+            external_userid=external_userid,
+            prime_info=prime_info,
+            text=final_reply.strip(),
+        )
+        logger.info(
+            "[sale_chat.push_sentences] session=%s | elapsed_ms=%d | DONE",
+            session_id, int((time.perf_counter() - t0) * 1000),
+        )
+
+        # ⑧ Shirley 5.3: 把本轮 sales 判定的 intent_level + 画像分析写回
+        await _analyze_and_save_profile(
+            corpid=corpid,
+            external_userid=external_userid,
+            history=history,
+            user_text=aggregated_text,
+            intent_level=intent_temperature,
+        )
+
+    except Exception as e:
+        logger.error(
+            "[sale_chat.process] session=%s FAILED | err=%s",
+            session_id, e, exc_info=True,
+        )
+
+
+# ── LLM 调用层 ──
+
+# LLM 异常时的兜底话术，保证 reply_lisa_message 一定被调用（核心指标）
+_FALLBACK_REPLY = "稍等一下哦，我这边看看～"
+
+# msgType=101 表示客户发的是图片消息（content 为图片 URL）
+_MSG_TYPE_IMAGE = 101
+
+# 图片多模态识别用的视觉模型（主模型 qwen3.7-flash 不支持 vision）。
+# 走同一个网关 base_url + api_key, 只换 model。留空则跳过图片识别。
+_VISION_MODEL = os.getenv("SALE_CHAT_VISION_MODEL", "qwen3.8-max")
+
+# KB 召回置信度阈值: max_score 低于此值视为"知识库答不上来", 触发降级转人工。
+# 实测 bge-m3 分布: 域内产品问题 0.65-0.81, 无关问题 ~0.47, 取 0.55 做分界。
+_KB_CONFIDENCE_THRESHOLD = float(os.getenv("SALE_CHAT_KB_MIN_SCORE", "0.55"))
+
+# 需要知识库事实支撑才算"答得上"的问题类型关键词。
+# 只保留价格/退款/有效期这类必须查知识库硬事实的; 竞品对比、课程咨询、
+# 适合几岁等 Lisa 用 soul 人格就能自然回答, 不走 KB 闸门(避免误伤正常销售对话)。
+_KB_REQUIRED_KEYWORDS = (
+    "多少钱", "价格", "费用", "学费", "优惠", "便宜",
+    "退款", "退费", "有效期", "多久",
+)
+
+# SOUL.md 缺失/读取失败时的最小兜底人格
+_SOUL_FALLBACK = """你是 Lisa —— 雪梨英语的班主任，在微信上跟家长一对一沟通。
+- 说话像真人，语气亲切，不用书面语
+- 回答简洁不啰嗦，一段 2-3 句
+- 先听懂孩子的情况，引导家长说出痛点，不要一开始就推销
+- 灵活灵活再灵活，别像机器人"""
+
+
+# saleChat 链路没有工具执行环节: SOUL.md 里描述的 partner_memorize 等工具
+# 在这里调不了, LLM 一旦吐出调用格式就会原文推给真实客户。必须显式禁止。
+_NO_TOOL_RULE = """
+
+## 本次对话的硬性输出约束（最高优先级，覆盖以上人格描述里的任何工具说明）
+你现在是在微信里直接跟家长发消息，**没有任何工具可以调用**。
+- 禁止输出 partner_memorize、tool_call、function_call 等任何工具调用
+- 禁止输出 JSON、大括号 {}、方括号 []、``` 代码块
+- 禁止输出 key="value" 这种参数写法
+- 只输出你要发给家长的纯中文口语句子，别的一个字都不要加
+你输出的每一个字都会被原样发到家长微信里，所以只能是人话。"""
+
+
+def _build_system_prompt(
+    profile_summary: str = "",
+    kb_context: str = "",
+) -> str:
+    """动态 Lisa soul = SOUL.md 基座 + qdrant 知识 + 画像摘要。
+
+    每轮对话重新读盘，所以在 Soul 管理后台改完人格下一轮立即生效。
+    读不到就回落到 _SOUL_FALLBACK，不阻断对话。
+    """
+    soul = ""
+    try:
+        from deeptutor.services.partners.workspace import read_soul
+        soul = (read_soul(SOUL_PARTNER_ID) or "").strip()
+    except Exception as e:
+        logger.warning("[sale_chat.soul] read_soul(%s) failed: %s", SOUL_PARTNER_ID, e)
+
+    if soul:
+        logger.info("[sale_chat.soul] loaded SOUL.md | partner=%s | chars=%d", SOUL_PARTNER_ID, len(soul))
+    else:
+        soul = _SOUL_FALLBACK
+        logger.warning("[sale_chat.soul] SOUL.md empty/missing, using fallback persona")
+
+    parts = [soul]
+    if kb_context:
+        parts.append(
+            "\n\n## 知识库检索结果（只作参考弹药, 用自己的话说, 竞品内容只做对比）\n"
+            + kb_context
+        )
+    if profile_summary:
+        parts.append(f"\n\n{profile_summary}")
+    parts.append(_NO_TOOL_RULE)
+    return "".join(parts)
+
+
+async def _llm_reply(
+    history: list[dict[str, str]],
+    aggregated: str,
+    *,
+    profile_summary: str = "",
+    kb_context: str = "",
+) -> str:
+    t0 = time.perf_counter()
+    try:
+        from deeptutor.services.llm import get_llm_client
+        llm = get_llm_client()
+
+        # 动态 Lisa soul（SOUL.md 实时读盘）+ 产品铁律 + qdrant 知识 + 画像摘要
+        system_prompt = _build_system_prompt(profile_summary, kb_context=kb_context)
+
+        clean_history: list[dict[str, str]] = []
+        for h in history:
+            role = h.get("role", "user")
+            if role not in ("user", "assistant", "system"):
+                role = "user"
+            content = h.get("content", "")
+            if content:
+                clean_history.append({"role": role, "content": content})
+
+        # 注意: factory._build_messages 一旦收到 messages/history 就会整包直接用,
+        # 丢掉 system_prompt 和 prompt。所以这里必须自己拼全量 messages,
+        # 否则 soul 和用户当前这句都进不了模型。
+        messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+        messages.extend(clean_history)
+        messages.append({"role": "user", "content": aggregated})
+
+        logger.info(
+            "[sale_chat._llm_reply →] soul_chars=%d | history_turns=%d | profile_len=%d "
+            "| kb_len=%d | prompt_chars=%d | msgs=%d",
+            len(system_prompt), len(clean_history), len(profile_summary or ""),
+            len(kb_context or ""), len(aggregated), len(messages),
+        )
+
+        reply = await llm.complete(
+            aggregated,
+            system_prompt=system_prompt,
+            history=messages,
+        )
+        text = (reply or "").strip() if isinstance(reply, str) else str(reply or "").strip()
+        logger.info(
+            "[sale_chat._llm_reply ←✓] elapsed_ms=%d | reply_chars=%d",
+            int((time.perf_counter() - t0) * 1000), len(text),
+        )
+        return text
+    except Exception as e:
+        logger.error(
+            "[sale_chat._llm_reply ←✗] elapsed_ms=%d | FAILED=%s",
+            int((time.perf_counter() - t0) * 1000), e, exc_info=True,
+        )
+        return ""
+
+
+# ── MCP 推送层 ──
+
+# SOUL.md 里描述了 partner_memorize 等工具，但 saleChat 没有工具执行环节，
+# LLM 吐出的工具调用 JSON 会原文漏给真实客户。推送前必须剥掉。
+_FENCE_RE = re.compile(r"```(?:json|tool_code|python)?\s*.*?(?:```|\Z)", re.S)
+
+# ① JSON 风格: {"tool_name": "partner_memorize", "arguments": {...}}
+_TOOL_JSON_RE = re.compile(
+    r"\{[^{}]*[\"'](?:tool_name|tool|name|arguments|parameters|data)[\"']\s*:.*?(?:\}\s*\}|\}|\Z)",
+    re.S,
+)
+
+# ② 函数调用风格: tool_call: partner_memorize(name=\"豆包\", grade=\"三年级\")
+#    LLM 实测会吐这种, 且 partner / _memorize 可能被换行拆开
+_TOOL_CALL_RE = re.compile(
+    r"(?:tool_call|tool|function_call|调用工具)\s*[:：]?\s*"
+    r"[A-Za-z_][\w\s]*?_?[\w]*\s*\(.*?(?:\)|\Z)",
+    re.S,
+)
+
+# ③ 裸参数残片: name=\"x\"  op=\"add\"  score=\"62\")
+_KV_ARG_RE = re.compile(r"[A-Za-z_]\w*\s*=\s*\\?[\"'][^\"']*\\?[\"']\s*[,)]?")
+
+_TOOL_LINE_RE = re.compile(
+    r"^\s*(?:[{}\[\]()]+|[\"']?(?:tool_name|tool|tool_call|arguments|parameters|data|preference"
+    r"|grade|pain_points|owned_products|child_name|op|score|name)[\"']?\s*[:=].*"
+    r"|\\?[\"'].*\\?[\"']\s*,?)\s*$"
+)
+
+# 出现这些词就说明该行是工具调用残片, 整行丢掉
+_TOOL_MARKERS = ("tool_call", "partner_memorize", "_memorize", "function_call",
+                 "tool_name", "arguments")
+
+
+def _strip_tool_calls(text: str) -> str:
+    """剥掉 LLM 回复里的工具调用（JSON / 代码块 / 函数调用风格），只留自然语言。
+
+    必须在分句之前调用: 否则 split_sentences 会把
+    `partner_memorize(name="豆包", grade="三年级")` 按逗号切成好几句,
+    每句都单独推给客户。
+    """
+    if not text:
+        return ""
+
+    cleaned = _FENCE_RE.sub(" ", text)
+    cleaned = _TOOL_JSON_RE.sub(" ", cleaned)
+    cleaned = _TOOL_CALL_RE.sub(" ", cleaned)
+
+    # 逐行兜底
+    kept: list[str] = []
+    for line in cleaned.splitlines():
+        low = line.lower()
+        if any(mk in low for mk in _TOOL_MARKERS):
+            continue
+        if _TOOL_LINE_RE.match(line):
+            continue
+        kept.append(line)
+    cleaned = "\n".join(kept)
+
+    # 漏网的 key="value" 残片
+    cleaned = _KV_ARG_RE.sub(" ", cleaned)
+
+    # 残留的转义引号 / 孤立括号
+    cleaned = re.sub(r'\\+"', '"', cleaned)
+    cleaned = re.sub(r"^[\s{}\[\](),]+|[\s{}\[\](),]+$", "", cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+
+async def _push_sentences(
+    *,
+    corpid: str,
+    external_userid: str,
+    prime_info: dict[str, Any],
+    text: str,
+) -> None:
+    if not text:
+        return
+
+    safe_text = _strip_tool_calls(text)
+    if safe_text != text:
+        logger.warning(
+            "[sale_chat.sanitize] stripped tool-call JSON | before=%d chars | after=%d chars",
+            len(text), len(safe_text),
+        )
+    if not safe_text:
+        logger.warning("[sale_chat.sanitize] nothing left after strip, using fallback")
+        safe_text = _FALLBACK_REPLY
+    text = safe_text
+
+    sentences = split_sentences(text) or [text]
+    third_uuid = str(prime_info.get("thirdSaleUuid") or "")
+    third_uid = prime_info.get("thirdUserId")
+    if third_uid is not None:
+        try:
+            third_uid = int(third_uid)
+        except (TypeError, ValueError):
+            third_uid = None
+
+    delay = TypingDelay(base=TYPING_BASE_DELAY, per_char=TYPING_PER_CHAR)
+    first = True
+    idx = 0
+    for s in sentences:
+        s = s.strip()
+        if not s:
+            continue
+        idx += 1
+        t0 = time.perf_counter()
+        try:
+            await qywx.send_lisa_message(
+                corpid=corpid,
+                external_userid=external_userid,
+                msg_text=s,
+                third_sale_uuid=third_uuid or None,
+                third_user_id=third_uid,
+                msg_type=qywx._MSG_TYPE_TEXT,
+                disable_dedup=True,
+            )
+            logger.info(
+                "[sale_chat.push_sentences] OK | idx=%d/%d | elapsed_ms=%d | text=%s",
+                idx, len(sentences), int((time.perf_counter() - t0) * 1000), s[:80],
+            )
+        except Exception as e:
+            logger.warning(
+                "[sale_chat.push_sentences] FAIL | idx=%d/%d | err=%s | text=%s",
+                idx, len(sentences), e, s[:80],
+            )
+
+        sleep_for = delay.base if first else delay.for_sentence(s)
+        if first:
+            first = False
+        await asyncio.sleep(sleep_for)
+
+
+async def _push_reject(
+    *,
+    corpid: str,
+    external_userid: str,
+    prime_info: dict[str, Any],
+    reason: str,
+) -> None:
+    third_uuid = str(prime_info.get("thirdSaleUuid") or "")
+    third_uid = prime_info.get("thirdUserId")
+    if third_uid is not None:
+        try:
+            third_uid = int(third_uid)
+        except (TypeError, ValueError):
+            third_uid = None
+    # 119 转人工 Shirley 网关要求 vid 或 thirdUserId, 从 primeInfo 透传 vid
+    vid = prime_info.get("vid")
+    if vid is not None:
+        try:
+            vid = int(vid)
+        except (TypeError, ValueError):
+            vid = None
+
+    t0 = time.perf_counter()
+    try:
+        await qywx.send_lisa_message(
+            corpid=corpid,
+            external_userid=external_userid,
+            msg_text=reason or "用户拒绝",
+            third_sale_uuid=third_uuid or None,
+            third_user_id=third_uid,
+            vid=vid,
+            msg_type=qywx._MSG_TYPE_REJECT,
+            answer=reason or "",
+            disable_dedup=True,
+        )
+        logger.info(
+            "[sale_chat.push_reject] OK | elapsed_ms=%d | reason=%s",
+            int((time.perf_counter() - t0) * 1000), (reason or "")[:200],
+        )
+    except Exception as e:
+        logger.warning("[sale_chat.push_reject] FAIL | elapsed_ms=%d | err=%s", int((time.perf_counter() - t0) * 1000), e)

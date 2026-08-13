@@ -351,6 +351,7 @@ from deeptutor.api.routers import (
     partners,
     partners_soul,
     partners_v2,
+    sale_chat,
     personas,
     plugins_api,
     question,
@@ -498,6 +499,12 @@ app.include_router(
     partners_v2.router,
     prefix="/api/v2",
     tags=["partners-v2"],
+)
+# Sale chat (Lisa 销售侧专用入口). 免认证 — 企微回调直接调用.
+app.include_router(
+    sale_chat.router,
+    prefix="/api/v1/partners",
+    tags=["sale-chat"],
 )
 app.include_router(
     attachments.router,

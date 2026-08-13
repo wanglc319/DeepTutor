@@ -153,7 +153,7 @@ class PartnerRunner:
         ext_userid = msg.metadata.get("external_userid") or ""
         if corpid and ext_userid:
             try:
-                from deeptutor.services import shirley_profile
+                from deeptutor.services.shirley import profile as shirley_profile
 
                 profile = await shirley_profile.fetch_profile(corpid, ext_userid)
                 summary = shirley_profile.summarize_profile(profile)
@@ -192,7 +192,7 @@ class PartnerRunner:
                 )
             if final and corpid and ext_userid:
                 try:
-                    from deeptutor.services import shirley_profile
+                    from deeptutor.services.shirley import profile as shirley_profile
 
                     hits = shirley_profile.should_trigger_analysis(msg.content)
                     if hits:

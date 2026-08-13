@@ -22,6 +22,13 @@ from deeptutor.tools.partner_memory import (
     PartnerSearchTool,
 )
 from deeptutor.tools.prompting import load_prompt_hints
+from deeptutor.services.shirley.live import ShirleyGetLiveScheduleTool
+from deeptutor.services.shirley.qywx import (
+    ShirleyQywxChatHistoryTool,
+    ShirleyQywxCustomerDetailTool,
+    ShirleyQywxMarkTagsTool,
+    ShirleyQywxSendMessageTool,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1605,6 +1612,12 @@ BUILTIN_TOOL_TYPES: tuple[type[BaseTool], ...] = (
     PartnerReadTool,
     PartnerMemorizeTool,
     PartnerSearchTool,
+    # Shirley partner tools — live schedule + QyWx customer ops.
+    ShirleyGetLiveScheduleTool,
+    ShirleyQywxCustomerDetailTool,
+    ShirleyQywxChatHistoryTool,
+    ShirleyQywxMarkTagsTool,
+    ShirleyQywxSendMessageTool,
 )
 
 # No tools are parked right now. When a tool's implementation is being
@@ -1703,4 +1716,9 @@ __all__ = [
     "WebSearchTool",
     "WriteMemoryTool",
     "WriteNoteTool",
+    "ShirleyGetLiveScheduleTool",
+    "ShirleyQywxChatHistoryTool",
+    "ShirleyQywxCustomerDetailTool",
+    "ShirleyQywxMarkTagsTool",
+    "ShirleyQywxSendMessageTool",
 ]
