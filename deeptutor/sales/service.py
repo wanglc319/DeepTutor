@@ -16,7 +16,7 @@ from .tagger import (
     llm_tag,
 )
 from .temperature import apply_temperature_to_profile
-from .actions import build_action_builder
+from .actions import build_action_builder, build_action_builder_async
 from . import db as sales_db
 
 logger = logging.getLogger(__name__)
@@ -100,8 +100,8 @@ async def process_customer_message(
     # 5. 温度 + 时间窗
     apply_temperature_to_profile(profile, first_seen_at, last_active_at)
 
-    # 6. 动作决策
-    action_text = build_action_builder(profile)
+    # 6. 动作决策（异步版优先走 MCP 拉直播链接）
+    action_text = await build_action_builder_async(profile)
 
     # 7. 写回 DB
     try:
