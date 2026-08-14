@@ -71,16 +71,31 @@ async def build_action_builder(
     corpid: str | None = None,
     external_userid: str | None = None,
     qywx_userid: str | None = None,
+    qywx_userid_fallback: str | None = None,
+    third_sale_uuid_fallback: str | None = None,
+    third_user_id_fallback: int | None = None,
+    vid_fallback: int | None = None,
 ) -> str | None:
     """返回要追加到 AI 回复尾部的动作文本，或 None."""
     action = decide_next_action(profile)
     profile.next_action = action
 
     if action == "proactive_live_push":
-        return await _build_live_push_text(
+        # 直播链接只推一次: 已推过就降级为 deepen_discovery
+        if profile.live_pushed:
+            profile.next_action = "deepen_discovery"
+            return None
+        text = await _build_live_push_text(
             profile, corpid=corpid, external_userid=external_userid,
             qywx_userid=qywx_userid,
+            qywx_userid_fallback=qywx_userid_fallback,
+            third_sale_uuid_fallback=third_sale_uuid_fallback,
+            third_user_id_fallback=third_user_id_fallback,
+            vid_fallback=vid_fallback,
         )
+        if text:
+            profile.live_pushed = True
+        return text
     return None
 
 
@@ -88,11 +103,15 @@ async def _get_live_url(
     corpid: str | None = None,
     external_userid: str | None = None,
     qywx_userid: str | None = None,
+    qywx_userid_fallback: str | None = None,
+    third_sale_uuid_fallback: str | None = None,
+    third_user_id_fallback: int | None = None,
+    vid_fallback: int | None = None,
 ) -> str | None:
     """取直播链接: 只走 Shirley MCP live skill (4.1 + 4)。
 
     4.1 可能返回多个 liveId → 逐场调 4 拿链接 → 按
-    "campPeriodName name：链接" 每场一行拼接返回。
+    "name：链接" 每场一行拼接返回。
     拿不到就返回 None, 调用方跳过直播推送 —— 绝不回落到写死的链接。
     环境变量 SALES_LIVE_URL 仅作人工应急覆盖。
     """
@@ -110,7 +129,11 @@ async def _get_live_url(
         try:
             from deeptutor.services.shirley import live as shirley_live
             sessions = await shirley_live.list_weekly_lives(
-                cid, external_userid, qywx_userid=qywx_userid
+                cid, external_userid, qywx_userid=qywx_userid,
+                qywx_userid_fallback=qywx_userid_fallback,
+                third_sale_uuid_fallback=third_sale_uuid_fallback,
+                third_user_id_fallback=third_user_id_fallback,
+                vid_fallback=vid_fallback,
             )
             lines = shirley_live.format_live_lines(sessions)
             if lines:
@@ -133,12 +156,22 @@ async def _build_live_push_text(
     corpid: str | None = None,
     external_userid: str | None = None,
     qywx_userid: str | None = None,
+    qywx_userid_fallback: str | None = None,
+    third_sale_uuid_fallback: str | None = None,
+    third_user_id_fallback: int | None = None,
+    vid_fallback: int | None = None,
 ) -> str | None:
     """构造直播推送的具体文案; MCP 拿不到链接时返回 None (跳过推送).
 
-    url 可能是多行 (每场直播一行 "campPeriodName name：链接")。
+    url 可能是多行 (每场直播一行 "name：链接")。
     """
-    url = await _get_live_url(corpid=corpid, external_userid=external_userid, qywx_userid=qywx_userid)
+    url = await _get_live_url(
+        corpid=corpid, external_userid=external_userid, qywx_userid=qywx_userid,
+        qywx_userid_fallback=qywx_userid_fallback,
+        third_sale_uuid_fallback=third_sale_uuid_fallback,
+        third_user_id_fallback=third_user_id_fallback,
+        vid_fallback=vid_fallback,
+    )
     if not url:
         return None
     grade = _grade_hint(profile)

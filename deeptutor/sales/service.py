@@ -31,6 +31,10 @@ async def process_customer_message(
     force_regex: bool = False,
     corpid: str | None = None,
     qywx_userid: str | None = None,
+    qywx_userid_fallback: str | None = None,
+    third_sale_uuid_fallback: str | None = None,
+    third_user_id_fallback: int | None = None,
+    vid_fallback: int | None = None,
 ) -> tuple[CustomerProfile, str | None]:
     """处理一条客户消息。返回 (更新后的 profile, 要追加到 AI 回复的动作文本或 None).
 
@@ -106,6 +110,10 @@ async def process_customer_message(
     action_text = await build_action_builder(
         profile, corpid=corpid, external_userid=customer_external_id,
         qywx_userid=qywx_userid,
+        qywx_userid_fallback=qywx_userid_fallback,
+        third_sale_uuid_fallback=third_sale_uuid_fallback,
+        third_user_id_fallback=third_user_id_fallback,
+        vid_fallback=vid_fallback,
     )
 
     # 7. 写回 DB

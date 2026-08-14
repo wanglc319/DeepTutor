@@ -101,6 +101,7 @@ class CustomerProfile:
     # 输出
     intent_temperature: str = TEMP_UNKNOWN
     next_action: str = "none"
+    live_pushed: bool = False  # 直播链接是否已推送过（只发一次）
 
     # 打标签来源
     tag_source: dict[str, str] = field(default_factory=dict)  # label -> "regex" | "llm" | "inherited"
@@ -130,5 +131,6 @@ class CustomerProfile:
             profile=prof,
             intent_temperature=d.get("intent_temperature", TEMP_UNKNOWN),
             next_action=d.get("next_action", "none"),
+            live_pushed=bool(d.get("live_pushed", False)),
             tag_source=dict(d.get("tag_source") or {}),
         )
