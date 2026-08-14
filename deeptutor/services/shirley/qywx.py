@@ -215,6 +215,11 @@ async def send_lisa_message(
     resolved: ResolvedIDs | None = None,
     skip_dedup: bool = False,
     disable_dedup: bool = False,
+    original_user_id: str | None = None,
+    customer_name: str | None = None,
+    qywx_userid: str | None = None,
+    is_prod: bool | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any] | None:
     """调 Shirley MCP reply_lisa_message (6) —— 通过 Lisa 账号给客户发消息。
 
@@ -255,7 +260,20 @@ async def send_lisa_message(
         "content": msg_text,
         "answer": answer or msg_text,
     }
-    # 119 转人工: Shirley 网关要求 vid 或 thirdUserId, 有 vid 就带上
+    # 补全 Shirley 网关要求的字段 (对照 mcp-debug.html)
+    if original_user_id:
+        payload["originalUserId"] = original_user_id
+    if customer_name:
+        payload["customerName"] = customer_name
+    if corpid:
+        payload["corpid"] = corpid
+    if qywx_userid:
+        payload["qywxUserid"] = qywx_userid
+    if is_prod is not None:
+        payload["isProd"] = bool(is_prod)
+    if session_id:
+        payload["sessionId"] = session_id
+    # 119 转人工: Shirley 网关要求 vid (转人工必填)
     if normalized_type == _MSG_TYPE_REJECT and vid:
         try:
             payload["vid"] = int(vid)

@@ -513,6 +513,10 @@ async def _process_session(
                 customer_external_id=external_userid,
                 corpid=corpid,
                 qywx_userid=str(prime_info.get("qywxUserid") or "") or None,
+                qywx_userid_fallback=str(prime_info.get("qywxUserid") or "") or None,
+                third_sale_uuid_fallback=str(prime_info.get("thirdSaleUuid") or "") or None,
+                third_user_id_fallback=int(prime_info.get("thirdUserId")) if prime_info.get("thirdUserId") is not None else None,
+                vid_fallback=int(prime_info.get("vid")) if prime_info.get("vid") is not None else None,
             )
             elapsed_sales = int((time.perf_counter() - t0) * 1000)
             intent_temperature = getattr(cust_profile, "intent_temperature", "unknown")
@@ -536,10 +540,12 @@ async def _process_session(
                 try:
                     from deeptutor.sales import qywx_tags
                     tag_ids = await qywx_tags.tag_ids_for_profile(cust_profile)
+                    _qywx_uid = str(prime_info.get("qywxUserid") or "") or None
                     await qywx_tags.apply_tags_to_customer(
                         corpid=corpid,
                         external_userid=external_userid,
                         tag_ids=tag_ids,
+                        follow_userid=_qywx_uid,
                     )
                 except Exception as tag_err:
                     logger.warning("[sale_chat.tag] session=%s | FAILED=%s", session_id, tag_err)
@@ -571,6 +577,25 @@ async def _process_session(
                 )
             except Exception as push_err:
                 logger.warning("[sale_chat.reject_push] session=%s | FAILED=%s", session_id, push_err)
+
+            # 转人工后清除 refusal 标记, 避免后续每条消息都重复转人工
+            if cust_profile is not None:
+                cust_profile.explicit_refusal = False
+                cust_profile.intent_signals.pop("explicit_refusal", None)
+                cust_profile.tag_source.pop("explicit_refusal", None)
+                try:
+                    from deeptutor.sales import db as sales_db
+                    row = await sales_db.get_customer_by_external_id(external_userid)
+                    if row:
+                        await sales_db.update_customer_profile(
+                            customer_id=row["id"],
+                            profile_json=cust_profile.to_dict(),
+                            intent_temperature=cust_profile.intent_temperature,
+                            next_action=cust_profile.next_action,
+                        )
+                    logger.info("[sale_chat.reject_clear] session=%s | refusal flag cleared", session_id)
+                except Exception as clear_err:
+                    logger.warning("[sale_chat.reject_clear] session=%s | FAILED=%s", session_id, clear_err)
 
             await _analyze_and_save_profile(
                 corpid=corpid,
@@ -939,6 +964,10 @@ async def _push_sentences(
                 third_user_id=third_uid,
                 msg_type=qywx._MSG_TYPE_TEXT,
                 disable_dedup=True,
+                original_user_id=str(prime_info.get("originalUserId") or "") or None,
+                customer_name=str(prime_info.get("customerName") or "") or None,
+                qywx_userid=str(prime_info.get("qywxUserid") or "") or None,
+                is_prod=prime_info.get("isProd"),
             )
             logger.info(
                 "[sale_chat.push_sentences] OK | idx=%d/%d | elapsed_ms=%d | text=%s",
@@ -990,6 +1019,10 @@ async def _push_reject(
             msg_type=qywx._MSG_TYPE_REJECT,
             answer=reason or "",
             disable_dedup=True,
+            original_user_id=str(prime_info.get("originalUserId") or "") or None,
+            customer_name=str(prime_info.get("customerName") or "") or None,
+            qywx_userid=str(prime_info.get("qywxUserid") or "") or None,
+            is_prod=prime_info.get("isProd"),
         )
         logger.info(
             "[sale_chat.push_reject] OK | elapsed_ms=%d | reason=%s",
