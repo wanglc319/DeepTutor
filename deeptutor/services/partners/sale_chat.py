@@ -35,8 +35,8 @@ from deeptutor.services.shirley import qywx
 logger = logging.getLogger(__name__)
 
 DEBOUNCE_SECONDS = 10.0
-TYPING_BASE_DELAY = 0.3
-TYPING_PER_CHAR = 0.04
+TYPING_BASE_DELAY = 0.5
+TYPING_PER_CHAR = 0.2
 
 # 动态 soul 的 partner_id: 从 data/partners/<id>/workspace/user/workspace/SOUL.md 读取
 # 后台改完 SOUL.md 下一轮对话立即生效, 无需重启
@@ -961,7 +961,7 @@ async def _push_sentences(
         except (TypeError, ValueError):
             third_uid = None
 
-    delay = TypingDelay(base=TYPING_BASE_DELAY, per_char=TYPING_PER_CHAR)
+    delay = TypingDelay(base=TYPING_BASE_DELAY, per_char=TYPING_PER_CHAR, max_delay=6.0)
     first = True
     idx = 0
     for s in sentences:
@@ -969,6 +969,17 @@ async def _push_sentences(
         if not s:
             continue
         idx += 1
+
+        # 第一句直接发，后续按实际句长延迟（模拟打字，比真人略快）
+        if not first:
+            sleep_for = delay.for_sentence(s)
+            logger.debug(
+                "[sale_chat.push_sentences] typing_wait | next_idx=%d | chars=%d | sleep=%.2fs",
+                idx, len(s), sleep_for,
+            )
+            await asyncio.sleep(sleep_for)
+        first = False
+
         t0 = time.perf_counter()
         try:
             await qywx.send_lisa_message(
@@ -993,11 +1004,6 @@ async def _push_sentences(
                 "[sale_chat.push_sentences] FAIL | idx=%d/%d | err=%s | text=%s",
                 idx, len(sentences), e, s[:80],
             )
-
-        sleep_for = delay.base if first else delay.for_sentence(s)
-        if first:
-            first = False
-        await asyncio.sleep(sleep_for)
 
 
 def _translate_refusal_source(source: str | None) -> str:
