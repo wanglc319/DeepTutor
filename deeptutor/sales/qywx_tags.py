@@ -163,6 +163,35 @@ async def tag_ids_for_profile(profile: Any, *, extra_names: list[str] | None = N
     return exact_ids
 
 
+async def resolve_extra_tag_ids(tag_names: list[str]) -> list[str]:
+    """把一组 tag_name 精确解析为 tag_id（用于额外打标场景，如勿扰）。"""
+    return await resolve_tag_names(tag_names)
+
+
+async def apply_do_not_disturb_tag(
+    *,
+    corpid: str,
+    external_userid: str,
+    follow_userid: str | None = None,
+) -> bool:
+    """明确拒绝/勿扰策略触发时，给客户打「勿扰」标签。
+
+    返回 True 表示成功打标，False 表示标签不存在或打标失败。
+    """
+    tag_ids = await resolve_extra_tag_ids(["勿扰"])
+    if not tag_ids:
+        logger.warning("[tag.dnd] 勿扰标签未在 tag_qywx 中找到，跳过打标")
+        return False
+    await apply_tags_to_customer(
+        corpid=corpid,
+        external_userid=external_userid,
+        tag_ids=tag_ids,
+        follow_userid=follow_userid,
+    )
+    logger.info("[tag.dnd] 勿扰标签已打 | external_userid=%s", external_userid)
+    return True
+
+
 async def apply_tags_to_customer(
     *,
     corpid: str,

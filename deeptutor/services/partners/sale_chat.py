@@ -525,10 +525,9 @@ async def _process_session(
             refusal_reason = ""
             if explicit_refusal:
                 sigs = getattr(cust_profile, "intent_signals", {}) or {}
-                refusal_reason = str(sigs.get("refusal_text") or "")[:200] if isinstance(sigs, dict) else ""
-                if not refusal_reason:
-                    ts = getattr(cust_profile, "tag_source", {}) or {}
-                    refusal_reason = f"explicit_refusal(source={ts.get('explicit_refusal', 'unknown')})"
+                ts = getattr(cust_profile, "tag_source", {}) or {}
+                raw_text = str(sigs.get("refusal_text") or "") if isinstance(sigs, dict) else ""
+                refusal_reason = _build_refusal_reason(raw_text, ts)
             logger.info(
                 "[sale_chat.sales] session=%s | elapsed_ms=%d | temp=%s | refusal=%s | next_action=%s | action_len=%d",
                 session_id, elapsed_sales, intent_temperature, explicit_refusal,
@@ -561,15 +560,30 @@ async def _process_session(
             explicit_refusal = False
             refusal_reason = ""
 
-        # ④ 拒绝分支: profile.explicit_refusal → 推 msgType=119 + 写画像 → return
+        # ④ 拒绝分支: profile.explicit_refusal → 打勿扰标签 + 推 msgType=119 + 写画像 → return
         if explicit_refusal:
             t0 = time.perf_counter()
+
+            # 4.1 打「勿扰」企微标签
+            try:
+                from deeptutor.sales import qywx_tags
+                _qywx_uid = str(prime_info.get("qywxUserid") or "") or None
+                await qywx_tags.apply_do_not_disturb_tag(
+                    corpid=corpid,
+                    external_userid=external_userid,
+                    follow_userid=_qywx_uid,
+                )
+            except Exception as dnd_err:
+                logger.warning("[sale_chat.reject_dnd] session=%s | FAILED=%s", session_id, dnd_err)
+
+            # 4.2 推 msgType=119 转人工，answer 包含 AI 分析原因 + 用户原话
             try:
                 await _push_reject(
                     corpid=corpid,
                     external_userid=external_userid,
                     prime_info=prime_info,
                     reason=refusal_reason or "用户明确拒绝",
+                    user_original=aggregated_text[:200],
                 )
                 logger.info(
                     "[sale_chat.reject_push] session=%s | elapsed_ms=%d | DONE",
@@ -639,6 +653,7 @@ async def _process_session(
                     external_userid=external_userid,
                     prime_info=prime_info,
                     reason=degrade_reason,
+                    user_original=raw_text[:200],
                 )
             except Exception as push_err:
                 logger.warning("[sale_chat.kb_degrade] push FAILED=%s", push_err)
@@ -985,12 +1000,47 @@ async def _push_sentences(
         await asyncio.sleep(sleep_for)
 
 
+def _translate_refusal_source(source: str | None) -> str:
+    """把 tag_source['explicit_refusal'] 的英文枚举翻译成销售能懂的中文。"""
+    _MAP = {
+        "regex": "关键词命中",
+        "llm": "AI判断",
+        "unknown": "自动判定",
+        "rule": "规则匹配",
+    }
+    if not source:
+        return "自动判定"
+    return _MAP.get(source, source)
+
+
+def _build_refusal_reason(
+    refusal_text: str,
+    tag_source: dict[str, Any] | None,
+) -> str:
+    """把 tagger 吐出的 refusal_text + tag_source 组合成中文拒绝原因（仅分析原因，不含原话）。
+
+    原话统一由 _format_reject_answer 的 "用户原话：" 行承载，避免重复。
+    """
+    if refusal_text:
+        return refusal_text[:200]
+    src = ""
+    if isinstance(tag_source, dict):
+        src = str(tag_source.get("explicit_refusal") or "")
+    return f"用户明确拒绝（触发来源：{_translate_refusal_source(src)}）"
+
+
+def _format_reject_answer(analysis_reason: str, user_original: str) -> str:
+    """构造转人工 answer：AI 分析原因 + 用户原话。"""
+    return f"转人工原因：{analysis_reason}\n用户原话：{user_original}"
+
+
 async def _push_reject(
     *,
     corpid: str,
     external_userid: str,
     prime_info: dict[str, Any],
     reason: str,
+    user_original: str = "",
 ) -> None:
     third_uuid = str(prime_info.get("thirdSaleUuid") or "")
     third_uid = prime_info.get("thirdUserId")
@@ -1007,17 +1057,20 @@ async def _push_reject(
         except (TypeError, ValueError):
             vid = None
 
+    # answer 必须同时包含 AI 分析原因和用户原话
+    answer = _format_reject_answer(reason or "用户明确拒绝", user_original or reason or "")
+
     t0 = time.perf_counter()
     try:
         await qywx.send_lisa_message(
             corpid=corpid,
             external_userid=external_userid,
-            msg_text=reason or "用户拒绝",
+            msg_text=answer,
             third_sale_uuid=third_uuid or None,
             third_user_id=third_uid,
             vid=vid,
             msg_type=qywx._MSG_TYPE_REJECT,
-            answer=reason or "",
+            answer=answer,
             disable_dedup=True,
             original_user_id=str(prime_info.get("originalUserId") or "") or None,
             customer_name=str(prime_info.get("customerName") or "") or None,
