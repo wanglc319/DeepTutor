@@ -168,6 +168,7 @@ async def apply_tags_to_customer(
     corpid: str,
     external_userid: str,
     tag_ids: list[str],
+    follow_userid: str | None = None,
 ) -> None:
     """调 Shirley MCP 2 接口打标签。tag_ids 为空则跳过。"""
     if not tag_ids:
@@ -176,10 +177,12 @@ async def apply_tags_to_customer(
     from deeptutor.services.shirley import qywx
     t0 = time.perf_counter()
     try:
-        res = await qywx.mark_tags(corpid, external_userid, tag_ids)
+        res = await qywx.mark_tags(
+            corpid, external_userid, tag_ids, follow_userid=follow_userid,
+        )
         logger.info(
-            "[tag.apply] elapsed_ms=%d | tag_ids=%s | ok=%s",
-            int((time.perf_counter() - t0) * 1000), tag_ids, res is not None,
+            "[tag.apply] elapsed_ms=%d | tag_ids=%s | follow_userid=%s | ok=%s",
+            int((time.perf_counter() - t0) * 1000), tag_ids, follow_userid or "(auto)", res is not None,
         )
     except Exception as e:
         logger.warning("[tag.apply] FAILED | err=%s", e)
