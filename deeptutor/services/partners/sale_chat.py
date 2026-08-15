@@ -22,21 +22,27 @@ Sale Chat Service
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass, field
 import logging
 import os
 import re
 import time
-from dataclasses import dataclass, field
 from typing import Any
 
+from deeptutor.observability.agent_monitor import (
+    detect_bad_case,
+    mark_mcp_failed,
+    observation,
+    redact_pii,
+)
 from deeptutor.services.partners.sentence_split import TypingDelay, split_sentences
 from deeptutor.services.shirley import qywx
 
 logger = logging.getLogger(__name__)
 
 DEBOUNCE_SECONDS = 10.0
-TYPING_BASE_DELAY = 0.5
-TYPING_PER_CHAR = 0.2
+TYPING_BASE_DELAY = 0.7
+TYPING_PER_CHAR = 1.3
 
 # 动态 soul 的 partner_id: 从 data/partners/<id>/workspace/user/workspace/SOUL.md 读取
 # 后台改完 SOUL.md 下一轮对话立即生效, 无需重启
@@ -193,6 +199,60 @@ async def _analyze_and_save_profile(
         logger.warning("[sale_chat.analyze_and_save] failed: %s", e)
 
 
+import re as _re_mod
+
+# 知识库中历史过期的直播回放链接（不可靠，不返回给用户）
+_LIVE_LINK_RE = _re_mod.compile(
+    r'https?://[^\s<>"\')\]]*(?:shirleyclass\.com|live\.|h5\.|watch\.)[^\s<>"\')\]]*',
+    _re_mod.IGNORECASE,
+)
+
+
+def _strip_live_links(text: str) -> str:
+    """清除知识库召回内容中的直播回放链接。
+
+    知识库里的直播链接是历史录入的，大部分已过期失效。
+    直播链接应从 MCP 接口实时获取，不使用知识库中的历史链接。
+    """
+    if not text:
+        return text
+    cleaned = _LIVE_LINK_RE.sub("[直播链接已移除，请从系统获取最新链接]", text)
+    # 清理可能残留的空 markdown 链接 [文字]()
+    cleaned = _re_mod.sub(r'\[([^\]]*)\]\(\s*\)', r'\1', cleaned)
+    return cleaned
+
+
+# 用户主动要直播链接时 LLM 输出的标记，后端检测到就调 MCP 拉取
+_LIVE_LINK_MARKER = "[LIVE_LINK]"
+
+
+async def _fetch_live_link_direct(prime_info: dict[str, Any], external_userid: str) -> str | None:
+    """用户主动要直播链接时，直接从 MCP 拉取（绕过温度档逻辑）。
+
+    复用 sales.actions._get_live_url 获取链接，用简化文案返回。
+    """
+    try:
+        from deeptutor.sales.actions import _get_live_url
+        corpid = str(prime_info.get("corpid") or "") or None
+        qywx_uid = str(prime_info.get("qywxUserid") or "") or None
+        url = await _get_live_url(
+            corpid=corpid,
+            external_userid=external_userid,
+            qywx_userid=qywx_uid,
+            qywx_userid_fallback=qywx_uid,
+            third_sale_uuid_fallback=str(prime_info.get("thirdSaleUuid") or "") or None,
+            third_user_id_fallback=int(prime_info.get("thirdUserId")) if prime_info.get("thirdUserId") is not None else None,
+            vid_fallback=int(prime_info.get("vid")) if prime_info.get("vid") is not None else None,
+        )
+        if not url:
+            logger.warning("[sale_chat.live_request] MCP returned no live url")
+            return None
+        return f"\n\n您要的直播链接来啦：\n{url}\n开播前 15 分钟进群还能拿专属预习资料~"
+    except Exception as e:
+        logger.warning("[sale_chat.live_request] failed: %s", e)
+        return None
+
+
 async def _fetch_kb_context(query: str, partner_id: str = SOUL_PARTNER_ID) -> tuple[str, float]:
     """走 qdrant 知识库检索, 把相关话术/知识片段压缩后注入 system prompt.
 
@@ -202,6 +262,9 @@ async def _fetch_kb_context(query: str, partner_id: str = SOUL_PARTNER_ID) -> tu
     与 runtime 一致: 列出 partner 绑定的 KB (kb_strategy 过滤), 逐个
     RAGService.search, 取 content 前若干字。任何一步失败都降级为空串,
     不阻断主链路。
+
+    注意: 知识库中可能包含历史过期的直播回放链接, 会在此处被清除。
+    直播链接应从 MCP 接口实时获取, 不使用知识库中的历史链接。
     """
     if not (query or "").strip():
         return "", 0.0
@@ -246,6 +309,8 @@ async def _fetch_kb_context(query: str, partner_id: str = SOUL_PARTNER_ID) -> tu
                     kb, int((time.perf_counter() - t0) * 1000), len(content), max_score,
                 )
                 if content:
+                    # 清除知识库中的历史过期直播链接
+                    content = _strip_live_links(content)
                     snippets.append(f"【{kb}】{content[:1200]}")
             except Exception as e:
                 logger.warning("[sale_chat.kb ←✗] kb=%s | FAILED=%s", kb, e)
@@ -361,8 +426,8 @@ async def _describe_images(image_urls: list[str]) -> str:
 
         import httpx
 
-        from deeptutor.services.llm import get_llm_client
         from deeptutor.services.llm import factory as llm_factory
+        from deeptutor.services.llm import get_llm_client
 
         cfg = get_llm_client().config
 
@@ -446,6 +511,14 @@ async def _kb_can_answer(question: str, kb_context: str) -> bool:
         return True
 
 
+@dataclass
+class _TraceOutcome:
+    reply: str = ""
+    transferred: bool = False
+    explicit_refusal: bool = False
+    llm_empty: bool = False
+
+
 async def _process_session(
     *,
     session_id: str,
@@ -453,6 +526,71 @@ async def _process_session(
     corpid: str,
     external_userid: str,
     prime_info: dict[str, Any],
+) -> None:
+    from deeptutor.observability.agent_monitor import has_mcp_failed, reset_trace_state
+
+    reset_trace_state()
+    outcome = _TraceOutcome()
+    trace_input = {
+        "messages": messages,
+        "corpid": corpid,
+        "externalUserid": external_userid,
+        "primeInfo": prime_info,
+    }
+    with observation(
+        "saleChat.turn",
+        input=trace_input,
+        metadata={"session_id": session_id, "message_count": len(messages)},
+        as_type="chain",
+    ) as root_span:
+        if root_span is not None:
+            root_span.update_trace(
+                name="saleChat.turn",
+                session_id=session_id,
+                user_id=redact_pii(external_userid, key="externalUserid"),
+                input=redact_pii(trace_input),
+                tags=["saleChat", os.getenv("LANGFUSE_ENVIRONMENT", "development")],
+            )
+        await _process_session_core(
+            session_id=session_id,
+            messages=messages,
+            corpid=corpid,
+            external_userid=external_userid,
+            prime_info=prime_info,
+            trace_outcome=outcome,
+        )
+        bad_case = detect_bad_case(
+            reply=outcome.reply,
+            mcp_failed=has_mcp_failed(),
+            llm_empty=outcome.llm_empty,
+            transferred=outcome.transferred,
+            explicit_refusal=outcome.explicit_refusal,
+        )
+        if root_span is not None:
+            root_span.update(
+                output=redact_pii({"reply": outcome.reply, "bad_case_reasons": bad_case.reasons}),
+                metadata={"bad_case": bad_case.is_bad, "bad_case_reasons": list(bad_case.reasons)},
+            )
+            root_span.update_trace(
+                output=redact_pii(outcome.reply),
+                tags=["saleChat", "bad-case"] if bad_case.is_bad else ["saleChat", "normal"],
+            )
+            root_span.score_trace(
+                name="bad_case",
+                value=bad_case.is_bad,
+                data_type="BOOLEAN",
+                comment=",".join(bad_case.reasons) if bad_case.reasons else "normal",
+            )
+
+
+async def _process_session_core(
+    *,
+    session_id: str,
+    messages: list[dict[str, Any]],
+    corpid: str,
+    external_userid: str,
+    prime_info: dict[str, Any],
+    trace_outcome: _TraceOutcome,
 ) -> None:
     raw_text = "\n".join(m.get("content", "") for m in messages if m.get("content")).strip()
     aggregated_text = _humanize_aggregated(raw_text)
@@ -562,6 +700,11 @@ async def _process_session(
 
         # ④ 拒绝分支: profile.explicit_refusal → 打勿扰标签 + 推 msgType=119 + 写画像 → return
         if explicit_refusal:
+            trace_outcome.transferred = True
+            trace_outcome.explicit_refusal = True
+            trace_outcome.reply = _format_reject_answer(
+                refusal_reason or "用户明确拒绝", aggregated_text[:200]
+            )
             t0 = time.perf_counter()
 
             # 4.1 打「勿扰」企微标签
@@ -643,6 +786,8 @@ async def _process_session(
                         f"AI 判定无法回答，已降级转人工处理。用户问题摘要：{raw_text[:80]}"
                     )
         if kb_degraded:
+            trace_outcome.transferred = True
+            trace_outcome.reply = _format_reject_answer(degrade_reason, raw_text[:200])
             logger.warning(
                 "[sale_chat.kb_degrade] session=%s | kb_required=%s | kb_score=%.4f | threshold=%.2f | → 转人工",
                 session_id, kb_required, kb_score, _KB_CONFIDENCE_THRESHOLD,
@@ -682,12 +827,28 @@ async def _process_session(
 
         # ⑥ 追加 sales service 的 action_text（直播链接等）
         final_reply = (full_reply or "").strip()
+        trace_outcome.llm_empty = not final_reply
         if action_text:
             final_reply += action_text
             logger.info(
                 "[sale_chat.sales_action] session=%s | appended %d chars",
                 session_id, len(action_text),
             )
+
+        # ⑥.1 LLM 意图识别: 回复中含 [LIVE_LINK] 标记 → 调 MCP 拉取最新直播链接替换
+        if _LIVE_LINK_MARKER in final_reply:
+            logger.info("[sale_chat.live_request] session=%s | LLM emitted [LIVE_LINK] marker", session_id)
+            live_text = await _fetch_live_link_direct(prime_info, external_userid)
+            if live_text:
+                final_reply = final_reply.replace(_LIVE_LINK_MARKER, live_text.strip())
+                logger.info(
+                    "[sale_chat.live_request] session=%s | replaced marker with %d chars",
+                    session_id, len(live_text),
+                )
+            else:
+                # MCP 没拉到链接，去掉标记，避免用户看到
+                final_reply = final_reply.replace(_LIVE_LINK_MARKER, "")
+                logger.warning("[sale_chat.live_request] session=%s | MCP returned no live url, marker removed", session_id)
 
         # ⑥.5 兜底: LLM 挂了也必须推一句, 保证 reply_lisa_message 一定被调用
         if not final_reply:
@@ -696,6 +857,8 @@ async def _process_session(
                 "[sale_chat.fallback] session=%s | LLM returned empty, using fallback reply",
                 session_id,
             )
+
+        trace_outcome.reply = final_reply.strip()
 
         # ⑦ 逐句推送
         t0 = time.perf_counter()
@@ -720,6 +883,8 @@ async def _process_session(
         )
 
     except Exception as e:
+        if not trace_outcome.reply:
+            trace_outcome.reply = f"处理异常：{type(e).__name__}"
         logger.error(
             "[sale_chat.process] session=%s FAILED | err=%s",
             session_id, e, exc_info=True,
@@ -765,10 +930,26 @@ _NO_TOOL_RULE = """
 ## 本次对话的硬性输出约束（最高优先级，覆盖以上人格描述里的任何工具说明）
 你现在是在微信里直接跟家长发消息，**没有任何工具可以调用**。
 - 禁止输出 partner_memorize、tool_call、function_call 等任何工具调用
-- 禁止输出 JSON、大括号 {}、方括号 []、``` 代码块
+- 禁止输出 JSON、大括号 {}、``` 代码块
 - 禁止输出 key="value" 这种参数写法
 - 只输出你要发给家长的纯中文口语句子，别的一个字都不要加
-你输出的每一个字都会被原样发到家长微信里，所以只能是人话。"""
+
+**唯一例外：直播链接 [LIVE_LINK]**
+只有当家长**明确表达了想看直播/试听课/回放的意愿**时，你才在回复末尾加上 [LIVE_LINK] 标记（独占一行）。系统会自动替换成最新的有效直播链接。
+严格判定标准——必须同时满足：
+1. 家长的话里有"直播""试听课""公开课""回放"等**课程观看类**词汇
+2. 且家长是在**要求获取链接/参与/观看**，而不是在拒绝、抱怨或陈述其他事情
+正面例子（应加 [LIVE_LINK]）：
+- "给我发个直播链接" / "怎么看电视直播" / "直播在哪看" / "我想试听一下" / "有回放链接吗"
+反面例子（绝对不加 [LIVE_LINK]）：
+- "你们课程有链接吗"（问的是课程介绍，不是直播）
+- "发个购买链接"（要的是下单链接，不是直播）
+- "我在别的链接买过了"（陈述事实）
+- "直播太贵了"（抱怨价格，不是要链接）
+- "课程链接发我看看"（要看课程资料，不是直播）
+如果不确定家长是否要直播链接，**不要加** [LIVE_LINK]，先口头引导确认。
+你不需要、也绝对不能自己编链接。
+你输出的每一个字（除了 [LIVE_LINK] 标记）都会被原样发到家长微信里，所以只能是人话。"""
 
 
 def _build_system_prompt(
@@ -797,6 +978,8 @@ def _build_system_prompt(
     if kb_context:
         parts.append(
             "\n\n## 知识库检索结果（只作参考弹药, 用自己的话说, 竞品内容只做对比）\n"
+            "注意：检索结果中可能残留的历史直播链接已过期失效，**绝对不要**在回复中包含任何链接。"
+            "如果家长要直播链接，系统会自动从 MCP 接口获取最新的有效链接推送。\n\n"
             + kb_context
         )
     if profile_summary:
@@ -961,7 +1144,7 @@ async def _push_sentences(
         except (TypeError, ValueError):
             third_uid = None
 
-    delay = TypingDelay(base=TYPING_BASE_DELAY, per_char=TYPING_PER_CHAR, max_delay=6.0)
+    delay = TypingDelay(base=TYPING_BASE_DELAY, per_char=TYPING_PER_CHAR, max_delay=30.0)
     first = True
     idx = 0
     for s in sentences:
@@ -1000,6 +1183,7 @@ async def _push_sentences(
                 idx, len(sentences), int((time.perf_counter() - t0) * 1000), s[:80],
             )
         except Exception as e:
+            mark_mcp_failed()
             logger.warning(
                 "[sale_chat.push_sentences] FAIL | idx=%d/%d | err=%s | text=%s",
                 idx, len(sentences), e, s[:80],
@@ -1088,4 +1272,5 @@ async def _push_reject(
             int((time.perf_counter() - t0) * 1000), (reason or "")[:200],
         )
     except Exception as e:
+        mark_mcp_failed()
         logger.warning("[sale_chat.push_reject] FAIL | elapsed_ms=%d | err=%s", int((time.perf_counter() - t0) * 1000), e)

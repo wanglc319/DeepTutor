@@ -28,129 +28,128 @@
   .ok { background: #065f46; color: #a7f3d0; }
   .err { background: #7f1d1d; color: #fecaca; }
 
-  main { flex: 1; display: flex; overflow: hidden; }
+  /* Tabs */
+  .tab-bar {
+    display: flex; background: #fff; border-bottom: 1px solid #e5e7eb;
+    padding: 0 16px; flex-shrink: 0;
+  }
+  .tab-btn {
+    padding: 12px 24px; font-size: 13px; font-weight: 500;
+    background: none; border: none; border-bottom: 2px solid transparent;
+    color: #6b7280; cursor: pointer; transition: all .15s;
+  }
+  .tab-btn:hover { color: #2563eb; }
+  .tab-btn.active { color: #2563eb; border-bottom-color: #2563eb; }
 
-  /* 左侧：编辑 + 策略 */
-  .left-panel {
-    flex: 1; display: flex; flex-direction: column; overflow: hidden;
-    gap: 12px; padding: 12px; min-width: 0;
+  main { flex: 1; overflow: hidden; position: relative; }
+  .tab-panel {
+    display: none; height: 100%;
   }
+  .tab-panel.active { display: flex; }
 
-  /* 右侧：多会话聊天 */
-  .right-panel {
-    width: 520px; display: flex; flex-direction: column;
-    border-left: 1px solid #e5e7eb; background: #fff;
-    flex-shrink: 0;
+  /* ── Tab 1: SOUL.md 编辑 ── */
+  #panel-soul { padding: 16px; gap: 16px; }
+  #panel-soul .editor-pane, #panel-soul .preview-pane {
+    flex: 1; display: flex; flex-direction: column; min-width: 0;
+    background: #fff; border-radius: 10px; padding: 14px;
+    box-shadow: 0 1px 3px rgba(0,0,0,.06);
   }
-  .chat-header {
-    padding: 10px 14px; border-bottom: 1px solid #e5e7eb;
-    display: flex; align-items: center; gap: 8px; background: #fafbfc;
+  .pane-label {
+    font-size: 11px; color: #9ca3af; margin-bottom: 8px;
+    text-transform: uppercase; display: flex; justify-content: space-between;
+    align-items: center; font-weight: 600; letter-spacing: .5px;
   }
-  .chat-header h2 { font-size: 13px; margin: 0; font-weight: 600; flex: 1; color: #111827; }
+  #soul-editor, .preview-pane .md-body {
+    flex: 1; border: 1px solid #e5e7eb; border-radius: 6px;
+    padding: 14px; font-family: "JetBrains Mono", Consolas, monospace;
+    font-size: 14px; line-height: 1.7; resize: none; outline: none;
+    overflow: auto; background: #fafbfc;
+  }
+  #soul-editor:focus { border-color: #2563eb; box-shadow: 0 0 0 3px rgba(37,99,235,.1); }
+  .preview-pane .md-body { background: #fff; font-family: inherit; color: #111827; font-size: 14px; }
+  .preview-pane .md-body h1 { font-size: 20px; margin: 0 0 12px; }
+  .preview-pane .md-body h2 { font-size: 16px; margin: 14px 0 8px; }
+  .preview-pane .md-body h3 { font-size: 14px; margin: 12px 0 6px; color: #374151; }
+  .preview-pane .md-body p { margin: 6px 0; }
+  .preview-pane .md-body code { background: #f3f4f6; padding: 1px 6px; border-radius: 3px; font-size: 13px; }
+  .preview-pane .md-body pre { background: #111827; color: #e5e7eb; padding: 12px; border-radius: 6px; overflow: auto; font-size: 13px; }
 
-  .chat-layout { flex: 1; display: flex; overflow: hidden; }
-  .session-sidebar {
-    width: 180px; border-right: 1px solid #e5e7eb;
-    display: flex; flex-direction: column; background: #f9fafb;
-    flex-shrink: 0;
+  /* ── Tab 2: 知识库策略 ── */
+  #panel-kb { padding: 16px; overflow-y: auto; }
+  .kb-card {
+    background: #fff; border-radius: 10px; padding: 18px;
+    box-shadow: 0 1px 3px rgba(0,0,0,.06); width: 100%; max-width: 800px;
+    margin: 0 auto;
   }
-  .session-sidebar .ss-header {
-    padding: 8px; display: flex; gap: 4px; border-bottom: 1px solid #e5e7eb;
+  .kb-card h2 { font-size: 15px; margin: 0 0 14px; color: #111827; }
+  .strategy-list { display: flex; flex-direction: column; gap: 8px; }
+  .strategy-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 12px 14px; border: 1px solid #e5e7eb; border-radius: 8px;
+    cursor: pointer; transition: all .15s;
   }
-  .session-sidebar button {
-    flex: 1; padding: 5px; font-size: 11px; border: 1px solid #e5e7eb;
-    background: #fff; border-radius: 4px; cursor: pointer;
+  .strategy-item:hover { border-color: #93c5fd; background: #eff6ff; }
+  .strategy-item.active { border-color: #2563eb; background: #dbeafe; }
+  .strategy-item input { margin: 0; width: 16px; height: 16px; accent-color: #2563eb; }
+  .strategy-item .label { font-size: 14px; font-weight: 500; color: #1f2937; }
+  .strategy-item .desc { font-size: 12px; color: #9ca3af; margin-left: auto; }
+  .kb-group-list {
+    margin-top: 16px; padding-top: 14px; border-top: 1px dashed #e5e7eb;
+    font-size: 13px; color: #6b7280;
   }
-  .session-sidebar button:hover { background: #eff6ff; border-color: #93c5fd; }
+  .kb-group-list div { margin: 4px 0; }
+  .kb-group-list .tag {
+    display: inline-block; padding: 2px 8px; border-radius: 4px;
+    font-size: 11px; margin-right: 6px; font-weight: 600;
+  }
+  .tag-feishu { background: #dbeafe; color: #1d4ed8; }
+  .tag-faq { background: #dcfce7; color: #15803d; }
+  .tag-other { background: #f3f4f6; color: #6b7280; }
+  .tag-active { margin-left: 4px; background: #2563eb; color: #fff; font-size: 10px; }
+  .row-actions { margin-top: 14px; display: flex; justify-content: flex-end; gap: 8px; }
+  .btn-ghost { padding: 7px 18px; font-size: 13px; border: 1px solid #e5e7eb; background: #fff; border-radius: 6px; cursor: pointer; }
+  .btn-ghost:hover { background: #f3f4f6; }
+
+  /* ── Tab 3: 模拟会话 ── */
+  #panel-chat { background: #fff; }
+  .chat-sidebar {
+    width: 200px; border-right: 1px solid #e5e7eb;
+    display: flex; flex-direction: column; background: #f9fafb; flex-shrink: 0;
+  }
+  .chat-sidebar .ss-header {
+    padding: 10px; display: flex; gap: 4px; border-bottom: 1px solid #e5e7eb;
+  }
+  .chat-sidebar button {
+    flex: 1; padding: 6px; font-size: 12px; border: 1px solid #e5e7eb;
+    background: #fff; border-radius: 5px; cursor: pointer;
+  }
+  .chat-sidebar button:hover { background: #eff6ff; border-color: #93c5fd; }
   .session-list { flex: 1; overflow-y: auto; padding: 6px; }
   .session-item {
-    padding: 7px 9px; border-radius: 6px; cursor: pointer;
+    padding: 8px 10px; border-radius: 6px; cursor: pointer;
     font-size: 12px; color: #374151; margin-bottom: 2px;
     border: 1px solid transparent; display: flex; justify-content: space-between; gap: 4px;
     word-break: break-all;
   }
   .session-item:hover { background: #eef2ff; }
   .session-item.active { background: #e0e7ff; border-color: #a5b4fc; color: #3730a3; font-weight: 500; }
-  .session-item .count { font-size: 10px; background: #dbeafe; color: #1d4ed8; padding: 1px 5px; border-radius: 8px; flex-shrink: 0; }
-  .session-item .del { color: #d1d5db; cursor: pointer; font-size: 11px; }
+  .session-item .count { font-size: 10px; background: #dbeafe; color: #1d4ed8; padding: 1px 6px; border-radius: 8px; flex-shrink: 0; }
+  .session-item .del { color: #d1d5db; cursor: pointer; font-size: 12px; }
   .session-item .del:hover { color: #dc2626; }
 
   .chat-main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
   .chat-session-info {
-    padding: 6px 12px; font-size: 11px; color: #9ca3af;
+    padding: 8px 14px; font-size: 11px; color: #9ca3af;
     border-bottom: 1px solid #f3f4f6; background: #fff;
     font-family: "JetBrains Mono", Consolas, monospace;
   }
-
-  .card {
-    background: #fff; border-radius: 10px; padding: 14px;
-    box-shadow: 0 1px 3px rgba(0,0,0,.06); display: flex; flex-direction: column;
-    overflow: hidden;
-  }
-  .card-title {
-    font-size: 13px; font-weight: 600; color: #374151; margin-bottom: 10px;
-    display: flex; justify-content: space-between; align-items: center;
-  }
-  .card-title .hint { font-size: 11px; color: #9ca3af; font-weight: normal; }
-
-  /* SOUL editor */
-  #soul-card { flex: 1; }
-  .editor-row { display: flex; gap: 10px; flex: 1; min-height: 0; }
-  .editor-pane, .preview-pane { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-  .pane-label { font-size: 11px; color: #9ca3af; margin-bottom: 6px; text-transform: uppercase; }
-  #soul-editor, .preview-pane .md-body {
-    flex: 1; border: 1px solid #e5e7eb; border-radius: 6px;
-    padding: 12px; font-family: "JetBrains Mono", Consolas, monospace;
-    font-size: 13px; line-height: 1.6; resize: none; outline: none;
-    overflow: auto; background: #fafbfc;
-  }
-  #soul-editor:focus { border-color: #2563eb; }
-  .preview-pane .md-body { background: #fff; font-family: inherit; color: #111827; }
-  .preview-pane .md-body h1 { font-size: 18px; margin: 0 0 8px; }
-  .preview-pane .md-body h2 { font-size: 15px; margin: 12px 0 6px; }
-  .preview-pane .md-body h3 { font-size: 13px; margin: 10px 0 4px; color: #374151; }
-  .preview-pane .md-body p { margin: 4px 0; }
-  .preview-pane .md-body code { background: #f3f4f6; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
-  .preview-pane .md-body pre { background: #111827; color: #e5e7eb; padding: 10px; border-radius: 6px; overflow: auto; font-size: 12px; }
-
-  /* Config */
-  #config-card { flex-shrink: 0; }
-  .strategy-list { display: flex; flex-direction: column; gap: 6px; }
-  .strategy-item {
-    display: flex; align-items: center; gap: 8px;
-    padding: 8px 10px; border: 1px solid #e5e7eb; border-radius: 6px;
-    cursor: pointer; transition: all .15s;
-  }
-  .strategy-item:hover { border-color: #93c5fd; background: #eff6ff; }
-  .strategy-item.active { border-color: #2563eb; background: #dbeafe; }
-  .strategy-item input { margin: 0; }
-  .strategy-item .label { font-size: 13px; font-weight: 500; color: #1f2937; }
-  .strategy-item .desc { font-size: 11px; color: #9ca3af; margin-left: auto; }
-  .kb-group-list {
-    margin-top: 10px; padding-top: 10px; border-top: 1px dashed #e5e7eb;
-    font-size: 12px; color: #6b7280;
-  }
-  .kb-group-list div { margin: 2px 0; }
-  .kb-group-list .tag {
-    display: inline-block; padding: 1px 6px; border-radius: 3px;
-    font-size: 10px; margin-right: 6px; font-weight: 600;
-  }
-  .tag-feishu { background: #dbeafe; color: #1d4ed8; }
-  .tag-faq { background: #dcfce7; color: #15803d; }
-  .tag-other { background: #f3f4f6; color: #6b7280; }
-  .tag-active { margin-left: 4px; background: #2563eb; color: #fff; }
-  .row-actions { margin-top: 10px; display: flex; justify-content: flex-end; gap: 8px; }
-  .btn-ghost { padding: 5px 14px; font-size: 12px; border: 1px solid #e5e7eb; background: #fff; border-radius: 5px; cursor: pointer; }
-  .btn-ghost:hover { background: #f3f4f6; }
-
-  /* Chat */
   .chat-messages {
-    flex: 1; overflow-y: auto; padding: 12px; background: #fafbfc;
+    flex: 1; overflow-y: auto; padding: 14px; background: #fafbfc;
     display: flex; flex-direction: column; gap: 8px;
   }
-  .msg { padding: 8px 12px; border-radius: 10px; font-size: 13px; line-height: 1.5; max-width: 90%; white-space: pre-wrap; word-break: break-word; }
-  .msg.user { background: #dbeafe; color: #1e40af; align-self: flex-end; border-bottom-right-radius: 2px; }
-  .msg.ai { background: #fff; color: #111827; border: 1px solid #e5e7eb; align-self: flex-start; border-bottom-left-radius: 2px; }
+  .msg { padding: 10px 14px; border-radius: 12px; font-size: 14px; line-height: 1.6; max-width: 85%; white-space: pre-wrap; word-break: break-word; }
+  .msg.user { background: #dbeafe; color: #1e40af; align-self: flex-end; border-bottom-right-radius: 3px; }
+  .msg.ai { background: #fff; color: #111827; border: 1px solid #e5e7eb; align-self: flex-start; border-bottom-left-radius: 3px; }
   .msg.ai.thinking::before { content: "💭 "; }
   .msg.ai.streaming::after { content: "▌"; animation: blink 1s infinite; }
   @keyframes blink { 50% { opacity: 0; } }
@@ -165,19 +164,19 @@
   }
   .msg-meta .meta-chip.score { background: #fef3c7; color: #92400e; border-color: #fde68a; }
   .msg-meta .meta-sep { color: #d1d5db; }
-  .chat-input-row { display: flex; gap: 6px; padding: 10px; border-top: 1px solid #e5e7eb; background: #fff; }
+  .chat-input-row { display: flex; gap: 8px; padding: 12px; border-top: 1px solid #e5e7eb; background: #fff; }
   .chat-input-row textarea {
-    flex: 1; padding: 8px 10px; border: 1px solid #e5e7eb; border-radius: 6px;
-    font-size: 13px; resize: none; height: 50px; outline: none;
+    flex: 1; padding: 10px 12px; border: 1px solid #e5e7eb; border-radius: 8px;
+    font-size: 14px; resize: none; height: 56px; outline: none; font-family: inherit;
   }
-  .chat-input-row textarea:focus { border-color: #2563eb; }
+  .chat-input-row textarea:focus { border-color: #2563eb; box-shadow: 0 0 0 3px rgba(37,99,235,.1); }
   .chat-input-row button {
-    padding: 0 16px; background: #2563eb; color: #fff; border: none;
-    border-radius: 6px; cursor: pointer; font-size: 13px;
+    padding: 0 20px; background: #2563eb; color: #fff; border: none;
+    border-radius: 8px; cursor: pointer; font-size: 14px; font-weight: 500;
   }
+  .chat-input-row button:hover { background: #1d4ed8; }
   .chat-input-row button:disabled { background: #9ca3af; cursor: not-allowed; }
-
-  .empty-chat { text-align: center; padding: 40px 20px; color: #9ca3af; font-size: 13px; }
+  .empty-chat { text-align: center; padding: 60px 20px; color: #9ca3af; font-size: 14px; }
 
   /* Toast */
   .toast {
@@ -195,36 +194,38 @@
 
 <header>
   <h1>🎛 Soul Admin</h1>
-  <input id="partner-id" placeholder="partner_id" value="lisa" style="width:100px">
+  <input id="partner-id" placeholder="partner_id" value="lisa" style="width:120px">
   <button onclick="loadAll()">🔄 加载</button>
   <div class="spacer"></div>
   <span id="status" class="status ok">就绪</span>
 </header>
 
-<main>
-  <div class="left-panel">
-    <div class="card" id="soul-card">
-      <div class="card-title">
-        <span>💬 SOUL.md 编辑</span>
-        <div style="display:flex;gap:8px">
-          <span class="hint">保存后下次会话自动注入</span>
-          <button class="btn-ghost" onclick="saveSoul()">💾 保存 SOUL</button>
-        </div>
-      </div>
-      <div class="editor-row">
-        <div class="editor-pane">
-          <div class="pane-label">Markdown 源码</div>
-          <textarea id="soul-editor" spellcheck="false" oninput="renderPreview()"></textarea>
-        </div>
-        <div class="preview-pane">
-          <div class="pane-label">实时预览</div>
-          <div class="md-body" id="soul-preview"></div>
-        </div>
-      </div>
-    </div>
+<div class="tab-bar">
+  <button class="tab-btn active" onclick="switchTab('soul')">💬 SOUL.md 编辑</button>
+  <button class="tab-btn" onclick="switchTab('kb')">📚 知识库策略</button>
+  <button class="tab-btn" onclick="switchTab('chat')">🧪 模拟会话</button>
+</div>
 
-    <div class="card" id="config-card">
-      <div class="card-title"><span>📚 知识库策略</span><span class="hint">下次会话生效</span></div>
+<main>
+  <!-- Tab 1: SOUL.md 编辑 -->
+  <div class="tab-panel active" id="panel-soul">
+    <div class="editor-pane">
+      <div class="pane-label">
+        <span>Markdown 源码</span>
+        <button class="btn-ghost" onclick="saveSoul()" style="padding:4px 14px;font-size:12px">💾 保存 SOUL</button>
+      </div>
+      <textarea id="soul-editor" spellcheck="false" oninput="renderPreview()"></textarea>
+    </div>
+    <div class="preview-pane">
+      <div class="pane-label"><span>实时预览</span><span style="font-weight:normal;color:#9ca3af">保存后 saleChat 下一轮自动注入</span></div>
+      <div class="md-body" id="soul-preview"></div>
+    </div>
+  </div>
+
+  <!-- Tab 2: 知识库策略 -->
+  <div class="tab-panel" id="panel-kb">
+    <div class="kb-card">
+      <h2>📚 检索策略选择</h2>
       <div class="strategy-list" id="strategy-list"></div>
       <div class="kb-group-list" id="kb-groups"></div>
       <div class="row-actions">
@@ -233,27 +234,23 @@
     </div>
   </div>
 
-  <div class="right-panel">
-    <div class="chat-header">
-      <h2>🧪 模拟会话</h2>
-      <button onclick="createNewSession()" class="ghost" style="padding:3px 10px;font-size:11px">＋ 新会话</button>
-    </div>
-    <div class="chat-layout">
-      <div class="session-sidebar">
-        <div class="ss-header">
-          <button onclick="clearAllSessions()">🗑 全部清除</button>
-        </div>
-        <div class="session-list" id="session-list"></div>
+  <!-- Tab 3: 模拟会话 -->
+  <div class="tab-panel" id="panel-chat">
+    <div class="chat-sidebar">
+      <div class="ss-header">
+        <button onclick="createNewSession()">＋ 新会话</button>
+        <button onclick="clearAllSessions()">🗑 清除</button>
       </div>
-      <div class="chat-main">
-        <div class="chat-session-info" id="session-info">（选择或创建一个会话）</div>
-        <div class="chat-messages" id="chat-messages">
-          <div class="empty-chat">← 点左侧"＋ 新会话"创建会话开始测试</div>
-        </div>
-        <div class="chat-input-row">
-          <textarea id="chat-input" placeholder="输入消息，Enter 发送，Shift+Enter 换行" onkeydown="handleChatKey(event)"></textarea>
-          <button id="chat-send" onclick="sendChat()" disabled>发送</button>
-        </div>
+      <div class="session-list" id="session-list"></div>
+    </div>
+    <div class="chat-main">
+      <div class="chat-session-info" id="session-info">（选择或创建一个会话）</div>
+      <div class="chat-messages" id="chat-messages">
+        <div class="empty-chat">← 点左侧"＋ 新会话"创建会话开始测试</div>
+      </div>
+      <div class="chat-input-row">
+        <textarea id="chat-input" placeholder="输入消息，Enter 发送，Shift+Enter 换行" onkeydown="handleChatKey(event)"></textarea>
+        <button id="chat-send" onclick="sendChat()" disabled>发送</button>
       </div>
     </div>
   </div>
@@ -265,19 +262,15 @@ const API = () => {
   return `/api/v1/partners/${pid}`;
 };
 
-const STORAGE_KEY = 'soul_admin_sessions_v1';
-
-// ── 全局状态 ──
-let sessions = {};          // { key: { messages: [{role,text}], created } }
-let currentSessionKey = null;
-let chatAbort = null;
-
-function loadSessions() {
-  try { sessions = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'); }
-  catch { sessions = {}; }
+// ── Tabs ──
+function switchTab(name) {
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.textContent.includes(
+    name === 'soul' ? 'SOUL.md' : name === 'kb' ? '知识库' : '模拟会话'
+  )));
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.toggle('active', p.id === 'panel-' + name));
 }
-function saveSessions() { localStorage.setItem(STORAGE_KEY, JSON.stringify(sessions)); }
 
+// ── Toast / Status ──
 function toast(msg, kind = 'ok') {
   const el = document.createElement('div');
   el.className = `toast ${kind}`;
@@ -325,7 +318,7 @@ async function saveSoul() {
       body: JSON.stringify({ content: document.getElementById('soul-editor').value })
     });
     setStatus('SOUL 已保存 ✅');
-    toast('SOUL.md 已保存（下次会话自动生效）');
+    toast('SOUL.md 已保存（saleChat 下一轮立即生效）');
   } catch (e) {
     setStatus('保存失败 ❌', 'err');
     toast('保存失败: ' + e.message, 'err');
@@ -362,8 +355,8 @@ function renderKbGroups() {
     const has = effectiveKbs.some(k => kbs.includes(k));
     parts.push(`<div><span class="tag tag-${group}">${group}</span>${kbs.join(', ')} ${has ? '<span class="tag-active">✓生效</span>' : ''}</div>`);
   }
-  parts.push(`<div style="margin-top:4px;padding-top:4px;border-top:1px dashed #e5e7eb">
-    实际生效: ${effectiveKbs.map(k => `<code>${k}</code>`).join(', ') || '<em>（无）</em>'}
+  parts.push(`<div style="margin-top:6px;padding-top:6px;border-top:1px dashed #e5e7eb">
+    实际生效: ${effectiveKbs.map(k => `<code style="background:#f3f4f6;padding:1px 6px;border-radius:3px;font-size:12px">${k}</code>`).join(' ') || '<em style="color:#9ca3af">（无）</em>'}
   </div>`);
   el.innerHTML = parts.join('');
 }
@@ -392,7 +385,7 @@ async function saveConfig() {
       body: JSON.stringify({ kb_strategy: currentStrategy })
     });
     setStatus('策略已保存 ✅');
-    toast('知识库策略已保存（下次会话自动生效）');
+    toast('知识库策略已保存（saleChat 下一轮立即生效）');
     await loadConfig();
   } catch (e) {
     setStatus('保存失败 ❌', 'err');
@@ -401,6 +394,17 @@ async function saveConfig() {
 }
 
 // ── Sessions ──
+const STORAGE_KEY = 'soul_admin_sessions_v1';
+let sessions = {};
+let currentSessionKey = null;
+let chatAbort = null;
+
+function loadSessions() {
+  try { sessions = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'); }
+  catch { sessions = {}; }
+}
+function saveSessions() { localStorage.setItem(STORAGE_KEY, JSON.stringify(sessions)); }
+
 function createNewSession() {
   const key = 'sess_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6);
   sessions[key] = { messages: [], created: Date.now() };
@@ -408,7 +412,6 @@ function createNewSession() {
   saveSessions();
   renderSessionList();
   renderCurrentSession();
-  toast('新会话: ' + key);
 }
 function deleteSession(key) {
   delete sessions[key];
@@ -433,15 +436,15 @@ function selectSession(key) {
 function renderSessionList() {
   const el = document.getElementById('session-list');
   const keys = Object.keys(sessions).sort((a, b) => sessions[b].created - sessions[a].created);
-  if (!keys.length) { el.innerHTML = '<div style="padding:10px;font-size:11px;color:#9ca3af;text-align:center">无会话</div>'; return; }
+  if (!keys.length) { el.innerHTML = '<div style="padding:12px;font-size:12px;color:#9ca3af;text-align:center">无会话</div>'; return; }
   el.innerHTML = keys.map(k => {
     const s = sessions[k];
-    const preview = (s.messages.find(m => m.role === 'user')?.text || '').slice(0, 16) || '(空会话)';
+    const preview = (s.messages.find(m => m.role === 'user')?.text || '').slice(0, 20) || '(空会话)';
     const count = s.messages.length;
     const active = k === currentSessionKey ? 'active' : '';
     return `<div class="session-item ${active}" onclick="selectSession('${k.replace(/'/g, "\\'")}')">
-      <span>${preview}</span>
-      <span style="display:flex;align-items:center;gap:4px">
+      <span>${escapeHtml(preview)}</span>
+      <span style="display:flex;align-items:center;gap:6px">
         <span class="count">${count}</span>
         <span class="del" onclick="event.stopPropagation();deleteSession('${k.replace(/'/g, "\\'")}')">×</span>
       </span>
@@ -472,8 +475,6 @@ function renderCurrentSession() {
   box.scrollTop = box.scrollHeight;
 }
 
-// ── Chat send (普通 JSON + 前端分句打字机) ──
-
 function _renderMsgMeta(meta) {
   const parts = [];
   if (meta.elapsed_ms != null) {
@@ -489,18 +490,13 @@ function _renderMsgMeta(meta) {
       const sourceFile = src.source || src.filename || '';
       const kbLabel = src.kb_name || '';
       const scorePct = src.score != null ? `· ${(src.score * 100).toFixed(0)}%` : '';
-      const pageLabel = src.page ? `· p.${src.page}` : '';
-      const topicLabel = src.topic ? `· ${src.topic}` : '';
-      // chip 主显示: title (退化 source)，hover 显示完整元数据
       const chipText = docTitle ? escapeHtml(docTitle) + scorePct : (escapeHtml(sourceFile || kbLabel));
       const tooltip = escapeHtml(
         [
           docTitle ? `标题: ${docTitle}` : null,
           sourceFile && sourceFile !== docTitle ? `文件: ${sourceFile}` : null,
-          topicLabel ? `章节: ${src.topic}` : null,
           kbLabel ? `知识库: ${kbLabel}` : null,
           src.score != null ? `相似度: ${(src.score * 100).toFixed(1)}%` : null,
-          src.page ? `页码: ${src.page}` : null,
         ].filter(Boolean).join(' ｜ ')
       );
       const chipCls = src.score != null ? 'meta-chip score' : 'meta-chip';
@@ -566,8 +562,6 @@ async function sendChat() {
   const sendBtn = document.getElementById('chat-send');
   sendBtn.disabled = true;
   chatAbort = { aborted: false };
-  const controller = new AbortController();
-  chatAbort.controller = controller;
 
   const box = document.getElementById('chat-messages');
   const thinkingEl = document.createElement('div');
@@ -580,13 +574,13 @@ async function sendChat() {
     const resp = await fetch(`${API()}/chat`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ content: text, session_key: currentSessionKey }),
-      signal: controller.signal,
     });
     if (!resp.ok) {
       const errText = await resp.text();
       box.appendChild(Object.assign(document.createElement('div'),
         { className: 'msg error', textContent: `HTTP ${resp.status}: ${errText}` }));
       thinkingEl.remove();
+      chatAbort = null; sendBtn.disabled = false;
       return;
     }
     const data = await resp.json();
@@ -600,6 +594,7 @@ async function sendChat() {
     if (!fullText) {
       box.appendChild(Object.assign(document.createElement('div'),
         { className: 'msg error', textContent: '⚠️ 服务返回空内容' }));
+      chatAbort = null; sendBtn.disabled = false;
       return;
     }
 
@@ -618,9 +613,7 @@ async function sendChat() {
         const metaHtml = _renderMsgMeta(msgMeta);
         if (metaHtml) aiMsgEl.insertAdjacentHTML('beforeend', metaHtml);
         if (sessions[currentSessionKey]) {
-          sessions[currentSessionKey].messages.push({
-            role: 'ai', text: displayed, meta: msgMeta,
-          });
+          sessions[currentSessionKey].messages.push({ role: 'ai', text: displayed, meta: msgMeta });
           saveSessions();
           renderSessionList();
         }
@@ -641,8 +634,7 @@ async function sendChat() {
         { className: 'msg error', textContent: '请求失败: ' + e.message }));
       thinkingEl.remove();
     }
-    chatAbort = null;
-    sendBtn.disabled = false;
+    chatAbort = null; sendBtn.disabled = false;
   }
 }
 
@@ -661,8 +653,9 @@ async function loadAll() {
 document.addEventListener('DOMContentLoaded', () => {
   renderStrategyList();
   loadSessions();
-  if (Object.keys(sessions).length) {
-    currentSessionKey = Object.keys(sessions).sort((a, b) => sessions[b].created - sessions[a].created)[0];
+  const keys = Object.keys(sessions);
+  if (keys.length) {
+    currentSessionKey = keys.sort((a, b) => sessions[b].created - sessions[a].created)[0];
   }
   renderSessionList();
   renderCurrentSession();

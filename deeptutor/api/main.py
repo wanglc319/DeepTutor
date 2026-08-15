@@ -234,6 +234,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Failed to close agentic LLM client pool: {e}")
 
+    try:
+        from deeptutor.observability.agent_monitor import flush_monitor
+
+        flush_monitor()
+        logger.info("Langfuse observations flushed")
+    except Exception as e:
+        logger.warning(f"Failed to flush Langfuse observations: {e}")
+
     # Stop EventBus
     try:
         from deeptutor.events.event_bus import get_event_bus
@@ -351,12 +359,12 @@ from deeptutor.api.routers import (
     partners,
     partners_soul,
     partners_v2,
-    sale_chat,
     personas,
     plugins_api,
     question,
     question_notebook,
     quiz_judge,
+    sale_chat,
     sessions,
     settings,
     skills,

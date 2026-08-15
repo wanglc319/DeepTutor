@@ -80,3 +80,43 @@ async def test_apply_do_not_disturb_tag_uses_exact_tag_name(monkeypatch) -> None
             "follow_userid": "sale-id",
         }
     ]
+
+@pytest.mark.asyncio
+async def test_push_sentences_marks_mcp_failed_on_send_failure(monkeypatch) -> None:
+    from deeptutor.observability.agent_monitor import has_mcp_failed, reset_trace_state
+
+    async def fail_send(**kwargs) -> None:
+        raise RuntimeError("send failed")
+
+    reset_trace_state()
+    monkeypatch.setattr(sale_chat.qywx, "send_lisa_message", fail_send)
+
+    await sale_chat._push_sentences(
+        corpid="corp-id",
+        external_userid="external-id",
+        prime_info={},
+        text="第一句",
+    )
+
+    assert has_mcp_failed() is True
+
+
+@pytest.mark.asyncio
+async def test_push_reject_marks_mcp_failed_on_send_failure(monkeypatch) -> None:
+    from deeptutor.observability.agent_monitor import has_mcp_failed, reset_trace_state
+
+    async def fail_send(**kwargs) -> None:
+        raise RuntimeError("send failed")
+
+    reset_trace_state()
+    monkeypatch.setattr(sale_chat.qywx, "send_lisa_message", fail_send)
+
+    await sale_chat._push_reject(
+        corpid="corp-id",
+        external_userid="external-id",
+        prime_info={},
+        reason="知识库无法回答",
+        user_original="课程怎么购买",
+    )
+
+    assert has_mcp_failed() is True

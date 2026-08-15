@@ -12,8 +12,8 @@ Shirley 直播 Skill
 """
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
+import logging
 from typing import Any
 
 from deeptutor.core.tool_protocol import BaseTool, ToolDefinition, ToolParameter
@@ -47,6 +47,10 @@ async def list_weekly_lives(
     domain: str | None = None,
     resolved: ResolvedIDs | None = None,
     qywx_userid: str | None = None,
+    qywx_userid_fallback: str | None = None,
+    third_sale_uuid_fallback: str | None = None,
+    third_user_id_fallback: int | None = None,
+    vid_fallback: int | None = None,
 ) -> list[LiveSession]:
     """拉取下一场/本周可预约的直播场次，每场均补全 play_url。
 
@@ -56,10 +60,15 @@ async def list_weekly_lives(
         return []
 
     if resolved is None:
-        resolved = await resolve_all(corpid, external_userid, domain=domain, qywx_userid=qywx_userid)
+        resolved = await resolve_all(
+            corpid,
+            external_userid,
+            domain=domain,
+            qywx_userid=qywx_userid or qywx_userid_fallback,
+        )
 
     added_at = resolved.added_at or ""
-    qywx_userid = resolved.qywx_userid or ""
+    qywx_userid = resolved.qywx_userid or qywx_userid or qywx_userid_fallback or ""
     camp_id = resolved.camp_id or 19913
 
     # ── 4.1: 拿 liveId 列表（失败重试, 耗尽记日志返回 None → 上层跳过）──
@@ -200,17 +209,70 @@ def _time_to_ts(val: Any) -> int | None:
     return None
 
 
+def _weekday_label(start_timestamp: int | None, start_time: str) -> str:
+    """根据开始时间生成 '本周X' 或 '下周X' 标签。
+
+    以自然周（周一为周首）计算，过期场次返回空串。
+    """
+    from datetime import datetime, timedelta
+
+    # 解析目标日期
+    target: datetime | None = None
+    if start_timestamp:
+        try:
+            target = datetime.fromtimestamp(int(start_timestamp))
+        except (TypeError, ValueError, OSError):
+            target = None
+    if target is None and start_time:
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                target = datetime.strptime(start_time.split(".")[0].split("+")[0], fmt)
+                break
+            except ValueError:
+                continue
+    if target is None:
+        return ""
+
+    now = datetime.now()
+    # 过期判定: 已过开始时间的不发
+    if target < now:
+        return ""
+
+    weekday_names = ["一", "二", "三", "四", "五", "六", "日"]
+    target_wd = target.weekday()  # 0=Monday
+
+    # 自然周: 周一为起点
+    target_monday = target.date() - timedelta(days=target_wd)
+    now_monday = now.date() - timedelta(days=now.weekday())
+    week_diff = (target_monday - now_monday).days // 7
+
+    if week_diff == 0:
+        return f"本周{weekday_names[target_wd]}"
+    elif week_diff == 1:
+        return f"下周{weekday_names[target_wd]}"
+    else:
+        return f"{target.month}月{target.day}日"
+
+
 def format_live_lines(sessions: list[LiveSession]) -> str:
-    """把多场直播拼成推送文案行: 每场一行 "name：链接"。"""
+    """把多场直播拼成推送文案行: 每场一行 "name（本周X）：链接"。
+
+    过期场次（beginTime < now）自动过滤，不会发给用户。
+    """
     lines: list[str] = []
     for s in sessions:
         if not s.play_url:
             continue
+        # 过滤过期场次
+        day_label = _weekday_label(s.start_timestamp, s.start_time)
+        if not day_label:
+            logger.info("[live] skip expired session | title=%s | start=%s", s.title[:30], s.start_time)
+            continue
         label = s.name.strip()
         if label:
-            lines.append(f"{label}：{s.play_url}")
+            lines.append(f"{label}（{day_label}）：{s.play_url}")
         else:
-            lines.append(s.play_url)
+            lines.append(f"{day_label}：{s.play_url}")
     return "\n".join(lines)
 
 

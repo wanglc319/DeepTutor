@@ -57,6 +57,7 @@ MANIFEST
 
 # Virtual Environments
 .env
+.env.sales
 *.env
 *.env.local
 env/

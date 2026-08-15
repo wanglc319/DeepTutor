@@ -27,9 +27,11 @@ logger = logging.getLogger(__name__)
 
 SHIRLEY_SOURCE = "deeptutor-lisa"
 
-# Shirley 5.3 文档规定的 14 项固定 key（含 intent_level、child_name）
+# Shirley 5.3 文档规定的固定 key（含 intent_level、child_name、relationship）
+# 共 15 项（relationship 用于家长主动声明关系如"奶奶/外婆"）
 ALL_PROFILE_KEYS: list[str] = [
     "child_name",
+    "relationship",
     "grade",
     "owned_products",
     "pain_points",
@@ -49,6 +51,7 @@ ALL_PROFILE_KEYS: list[str] = [
 # 超过自动截断，summary 额外加"…"，values 数组逐项独立截断
 _ATTR_LENGTH_LIMITS: dict[str, int] = {
     "child_name":          10,
+    "relationship":        10,
     "grade":               15,
     "pain_points":         50,
     "level_self_report":   25,
@@ -95,6 +98,9 @@ def _truncate_attr(attr: dict[str, Any]) -> dict[str, Any]:
 _PROFILE_KEYWORDS: dict[str, list[str]] = {
     "child_name": ["叫什么", "小名叫", "宝贝叫", "孩子叫", "娃叫", "大名", "昵称",
                    "宝宝叫", "闺女叫", "儿子叫", "女儿叫", "我家娃叫"],
+    "relationship": ["我是奶奶", "我是外婆", "我是姥姥", "我是爷爷", "我是外公",
+                    "我是爸爸", "我是妈妈", "我是后妈", "我是后爸",
+                    "奶奶", "外婆", "姥姥", "爷爷", "外公", "姥爷"],
     "grade": ["年级", "几岁", "多大", "九月升", "几年级", "小升初", "中考", "高考",
               "初一", "初二", "初三", "高一", "高二", "高三", "一年级", "二年级",
               "三年级", "四年级", "五年级", "六年级"],
@@ -127,32 +133,35 @@ _PROFILE_KEYWORDS: dict[str, list[str]] = {
 _EXTRACT_PROMPT = """你是一个专业的客户画像分析师。根据下面的对话历史，提取客户画像信息。
 
 只提取你**确信**从对话中能看出的属性；不确定的字段留空。不要编造。
+**严禁从家长的微信昵称/网名里提取 child_name**（那是家长的网名，不是孩子小名）。
 
 ## 对话历史
 {history}
 
-## 需要提取的 13 项属性（严格按此 key 名，intent_level 由调用方单独判定）
-1. child_name — 学员昵称/小名（如 "小明"、"豆豆"）
-2. grade — 年级/年龄（如 "三年级"、"8岁"、"初三"）
-3. owned_products — 已购买或提到的产品（多个用顿号分隔）
-4. pain_points — 客户提到的痛点
-5. level_self_report — 客户自述英语水平
-6. school_english_start — 学校英语从几年级开始/教材版本
-7. available_time — 每天/每周可用于学习的时间
-8. external_classes — 报过的课外班
-9. price_sensitivity — 价格敏感度
-10. coaching_ability — 家长辅导能力
-11. multi_child — 多孩情况
-12. region_textbook — 地区/教材
-13. decision_makers — 决策人
+## 需要提取的 14 项属性（严格按此 key 名，intent_level 由调用方单独判定）
+1. child_name — 学员昵称/小名（如 "小明"、"豆豆"）。必须是家长在对话中主动提到的孩子名字；**不要从家长微信昵称、网名里提取**
+2. relationship — 家长与孩子的关系（如 "妈妈"、"爸爸"、"奶奶"、"外婆"）。仅当家长明确说"我是孩子XX"时提取；不确定留空
+3. grade — 年级/年龄（如 "三年级"、"8岁"、"初三"）
+4. owned_products — 已购买或提到的产品（多个用顿号分隔）
+5. pain_points — 客户提到的痛点
+6. level_self_report — 客户自述英语水平
+7. school_english_start — 学校英语从几年级开始/教材版本
+8. available_time — 每天/每周可用于学习的时间
+9. external_classes — 报过的课外班
+10. price_sensitivity — 价格敏感度
+11. coaching_ability — 家长辅导能力
+12. multi_child — 多孩情况
+13. region_textbook — 地区/教材
+14. decision_makers — 决策人
 
 ## 输出格式
 只输出严格的 JSON（不要 Markdown，不要解释），格式：
 {{
   "child_name": "",
+  "relationship": "",
   "grade": "",
   "owned_products": "",
-  ...（其余同格式，共 13 个 key）
+  ...（其余同格式，共 14 个 key）
 }}
 """
 
@@ -381,26 +390,35 @@ async def analyze_and_save(
     prev_ai_analysis: dict[str, Any] | None = None,
     intent_level: str | None = None,
 ) -> dict[str, Any] | None:
-    """一键: LLM 抽字段 → 合并 intent_level → 调 5.3 保存。
+    """一键: 关键词门槛 → 命中才 LLM 抽字段 → 合并 intent_level → 调 5.3 保存。
+
+    只当用户消息命中画像关键词（如"小名叫""我是孩子奶奶"）时才触发 LLM 抽取，
+    否则跳过 LLM 直接把 intent_level 写入 5.3（省 token）。
 
     intent_level 通常来自 sales tagger 的判定结果（high/medium/low）。
-
-    Shirley schema 兼容 (网关灰度中，13/14 项不稳定):
-      - 先发 14 项 (child_name + 13)
-      - 若被拒自动降级发 13 项 (去掉 child_name)
-      - 双向重试直到成功；最坏情况返回 None（画像非关键路径）
     """
     from deeptutor.services.shirley.client import ShirleyMCPToolError
 
-    extracted = await analyze_from_dialogue(history, user_text, prev_ai_analysis)
-    base = build_empty_attributes()
-    attrs_14 = merge_into_attributes(base, extracted or {}, intent_level)
-    attrs_13 = [a for a in attrs_14 if a.get("key") != "child_name"]
+    # ── 关键词门槛: 命中画像关键词才跑 LLM 抽取 ──
+    # 家长说"嗯""好的""哈哈"这类不触发抽取，只写 intent_level
+    triggers = should_trigger_analysis(user_text)
+    extracted: dict[str, str] | None = None
+    if triggers:
+        extracted = await analyze_from_dialogue(history, user_text, prev_ai_analysis)
+        logger.info(
+            "[profile.analyze] hits=%s | extracted_keys=%s | ext_ok=%s",
+            triggers, list(extracted.keys()) if extracted else [], bool(extracted),
+        )
 
-    # 候选顺序: 先 14 再 13 —— 理论上 14 是最新 schema
+    base = build_empty_attributes()
+    attrs_full = merge_into_attributes(base, extracted or {}, intent_level)
+    attrs_no_rel = [a for a in attrs_full if a.get("key") != "relationship"]
+    attrs_no_child = [a for a in attrs_no_rel if a.get("key") != "child_name"]
+
     candidates = [
-        ("14 attrs (with child_name)", attrs_14),
-        ("13 attrs (legacy)", attrs_13),
+        ("15 attrs (with child_name + relationship)", attrs_full),
+        ("14 attrs (without relationship)", attrs_no_rel),
+        ("13 attrs (legacy)", attrs_no_child),
     ]
 
     last_err: ShirleyMCPToolError | None = None
@@ -419,9 +437,8 @@ async def analyze_and_save(
             last_err = e
             logger.info("Shirley 5.3 attempt [%s] failed: %s", label, str(e)[:80])
 
-    # 画像写回属非关键路径: 重试全失败也只记日志跳过, 不影响 reply_lisa_message
     logger.warning(
-        "Shirley 5.3 SKIPPED after retries (tried 14 attrs + 13 attrs, gateway schema unstable): %s",
+        "Shirley 5.3 SKIPPED after retries (tried all 3 schema sizes, gateway unstable): %s",
         last_err,
     )
     return None
@@ -433,6 +450,68 @@ def _error_hints_13(err_msg: str) -> bool:
 
 
 # ── 画像摘要（注入 system prompt） ──
+
+_MALE_HINTS = ("爸爸", "爸爸", "爷爷", "外公", "姥爷", "哥", "兄")
+_FEMALE_HINTS = ("妈妈", "妈妈", "奶奶", "外婆", "姥姥", "姐", "妹", "姑", "姨")
+_RELATIONSHIP_ALIASES = {
+    "外婆": "外婆", "姥姥": "外婆",
+    "外公": "外公", "姥爷": "外公",
+    "爸爸": "爸爸", "老爸": "爸爸", "爹": "爸爸",
+    "妈妈": "妈妈", "老妈": "妈妈", "妈": "妈妈",
+}
+
+
+def _guess_gender_from_nickname(nickname: str) -> str | None:
+    """从家长微信昵称里粗判性别（不可靠，仅作低置信度参考）。
+
+    返回 'female' / 'male' / None。只在有明确"妈妈""爸爸"等字样时才敢判，
+    纯名字（如"超人不会流眼泪"）一律返回 None。
+    """
+    if not nickname:
+        return None
+    for hint in _FEMALE_HINTS:
+        if hint in nickname:
+            return "female"
+    for hint in _MALE_HINTS:
+        if hint in nickname:
+            return "male"
+    return None
+
+
+def _resolve_recommended_address(
+    *,
+    child_name: str,
+    relationship: str,
+    nickname: str,
+) -> tuple[str, str]:
+    """四阶段称呼解析：(推荐称呼, 来源说明)
+
+    Stage 1 - 家长主动声明关系: "我是孩子奶奶" → "奶奶"
+    Stage 2 - 有孩子名 + 关系: "XX妈妈" / "XX爸爸"
+    Stage 3 - 只有孩子名: "XX家长"
+    Stage 4 - 啥也没有: "家长"
+    """
+    # Stage 1: 家长主动声明的关系（最可信）
+    if relationship:
+        normalized = _RELATIONSHIP_ALIASES.get(relationship, relationship)
+        if child_name:
+            return f"{child_name}{normalized}", "家长主动声明关系"
+        return normalized, "家长主动声明关系"
+
+    gender = _guess_gender_from_nickname(nickname)
+
+    # Stage 2: 有孩子名 + 可推断性别
+    if child_name and gender:
+        suffix = "妈妈" if gender == "female" else "爸爸"
+        return f"{child_name}{suffix}", "微信昵称粗判性别（低置信）"
+
+    # Stage 3: 只有孩子名，性别不明 → "XX家长"
+    if child_name:
+        return f"{child_name}家长", "有孩子名，性别不明"
+
+    # Stage 4: 什么都没有 → 统称"家长"
+    return "家长", "尚未获取孩子名和关系"
+
 
 def summarize_profile(profile: dict[str, Any] | None) -> str:
     """把完整 profile 压缩成 system prompt 能装下的摘要。"""
@@ -456,7 +535,6 @@ def summarize_profile(profile: dict[str, Any] | None) -> str:
         for key in ("region", "grade"):
             if basic.get(key):
                 region_bits.append(str(basic[key]))
-        # Shirley 有 province + city 分开，拼一下
         if basic.get("province") and basic.get("city"):
             region_bits.insert(0, f"{basic['province']}{basic['city']}")
         if region_bits:
@@ -481,9 +559,12 @@ def summarize_profile(profile: dict[str, Any] | None) -> str:
                 return str(t)
             tag_names = [_tag_name(t) for t in tags[:8]]
             parts.append(f"- 企微标签: {', '.join(tag_names)}")
+
+        # ── 画像核心属性 ──
+        child_name_val = ""
+        relationship_val = ""
         if ai and isinstance(ai, dict):
             attrs_list = ai.get("attributes") or []
-            # attributes 是 [{"key","values","summary","confidence","evidence"}, ...]
             attr_by_key: dict[str, dict[str, Any]] = {}
             if isinstance(attrs_list, list):
                 for a in attrs_list:
@@ -492,10 +573,27 @@ def summarize_profile(profile: dict[str, Any] | None) -> str:
             elif isinstance(attrs_list, dict):
                 attr_by_key = attrs_list
 
-            # 核心 4 项单独展示
-            _core_keys = ("child_name", "grade", "intent_level", "pain_points")
+            def _attr_val(key: str) -> str:
+                a = attr_by_key.get(key)
+                if not a:
+                    return ""
+                vals = a.get("values") or []
+                if vals:
+                    return str(vals[0]).strip()
+                s = str(a.get("summary") or "").strip()
+                return "" if s == "未提取到" else s
+
+            child_name_val = _attr_val("child_name")
+            relationship_val = _attr_val("relationship")
+
+            # 核心项展示
+            _core_keys = ("child_name", "relationship", "grade", "intent_level", "pain_points")
             core_bits: list[str] = []
             for ck in _core_keys:
+                if ck == "child_name" and not child_name_val:
+                    continue
+                if ck == "relationship" and not relationship_val:
+                    continue
                 a = attr_by_key.get(ck)
                 if not a:
                     continue
@@ -518,6 +616,18 @@ def summarize_profile(profile: dict[str, Any] | None) -> str:
                     rest_brief.append(f"{k}={s}")
             if rest_brief:
                 parts.append(f"- 画像补充: {'; '.join(rest_brief[:5])}")
+
+        # ── 推荐称呼（核心！注入到 prompt 顶部让 LLM 第一眼看到） ──
+        nickname = str(identity.get("name") or basic.get("customerRemark") or "")
+        addr, addr_source = _resolve_recommended_address(
+            child_name=child_name_val,
+            relationship=relationship_val,
+            nickname=nickname,
+        )
+        # 把推荐称呼放在第一行，让 LLM 一眼看到
+        addr_line = f"- 推荐称呼: {addr}（{addr_source}）"
+        parts.insert(0, addr_line)
+
         if not parts:
             return ""
         return "【用户画像】\n" + "\n".join(parts)

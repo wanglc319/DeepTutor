@@ -19,6 +19,8 @@ from typing import Any
 
 import httpx
 
+from deeptutor.observability.agent_monitor import mark_mcp_failed, observation, redact_pii
+
 logger = logging.getLogger(__name__)
 
 SHIRLEY_MCP_URL = os.getenv(
@@ -64,6 +66,27 @@ async def call_tool(tool_name: str, arguments: dict[str, Any]) -> Any:
     所有网络异常 → ShirleyMCPNetworkError（上层可以捕获降级）。
     自动打结构化日志：入参 / 出参 / 耗时 / 成功失败。
     """
+    with observation(
+        f"mcp.{tool_name}",
+        input=arguments,
+        metadata={"tool_name": tool_name, "endpoint": SHIRLEY_MCP_URL},
+        as_type="tool",
+    ) as span:
+        try:
+            result = await _call_tool(tool_name, arguments)
+        except Exception as exc:
+            mark_mcp_failed()
+            if span is not None:
+                span.update(level="ERROR", status_message=str(exc))
+            raise
+
+        if span is not None:
+            span.update(output=redact_pii(result))
+        return result
+
+
+async def _call_tool(tool_name: str, arguments: dict[str, Any]) -> Any:
+    """执行 Shirley MCP 工具调用。"""
     t0 = time.perf_counter()
     logger.info("[Shirley MCP →] %s | args=%s", tool_name, _snippet(arguments))
 

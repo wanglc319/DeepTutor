@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from typing import Any, TypedDict
 
 from deeptutor.config.settings import settings
+from deeptutor.observability.agent_monitor import generation, redact_pii
 from deeptutor.services.provider_registry import (
     PROVIDERS,
     canonical_provider_name,
@@ -379,23 +380,55 @@ async def complete(
         binding=capability_binding, model=config.model, kwargs=kwargs
     )
 
-    try:
-        response = await provider.chat_with_retry(
-            messages=request_messages,
-            model=config.model,
-            reasoning_effort=config.reasoning_effort,
-            retry_delays=retry_delays,
-            allow_image_fallback=not supports_vision(capability_binding, config.model),
-            **extra_kwargs,
-        )
-    except Exception as exc:
-        raise map_error(exc, provider=config.provider_name) from exc
+    model_parameters = {
+        key: value
+        for key, value in extra_kwargs.items()
+        if key in {"temperature", "top_p", "max_tokens", "frequency_penalty", "presence_penalty"}
+        and isinstance(value, (str, int, float, bool))
+    }
+    with generation(
+        "llm.complete",
+        input=request_messages,
+        model=config.model,
+        model_parameters=model_parameters,
+        metadata={"provider": config.provider_name, "binding": capability_binding},
+    ) as generation_span:
+        try:
+            response = await provider.chat_with_retry(
+                messages=request_messages,
+                model=config.model,
+                reasoning_effort=config.reasoning_effort,
+                retry_delays=retry_delays,
+                allow_image_fallback=not supports_vision(capability_binding, config.model),
+                **extra_kwargs,
+            )
+        except Exception as exc:
+            if generation_span is not None:
+                generation_span.update(level="ERROR", status_message=str(exc))
+            raise map_error(exc, provider=config.provider_name) from exc
 
-    if response.finish_reason == "error":
-        raise map_error(
-            RuntimeError(response.content or "LLM request failed"), provider=config.provider_name
-        )
-    return response.content or ""
+        if response.finish_reason == "error":
+            if generation_span is not None:
+                generation_span.update(level="ERROR", status_message=response.content or "LLM request failed")
+            raise map_error(
+                RuntimeError(response.content or "LLM request failed"), provider=config.provider_name
+            )
+        content = response.content or ""
+        if generation_span is not None:
+            usage = getattr(response, "usage", None)
+            usage_details = None
+            if usage is not None:
+                usage_details = {
+                    "input": int(getattr(usage, "prompt_tokens", 0) or 0),
+                    "output": int(getattr(usage, "completion_tokens", 0) or 0),
+                    "total": int(getattr(usage, "total_tokens", 0) or 0),
+                }
+            generation_span.update(
+                output=redact_pii(content),
+                usage_details=usage_details,
+                metadata={"finish_reason": response.finish_reason},
+            )
+        return content
 
 
 async def stream(
