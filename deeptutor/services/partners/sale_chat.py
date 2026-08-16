@@ -272,14 +272,14 @@ async def _fetch_kb_context(query: str, partner_id: str = SOUL_PARTNER_ID) -> tu
         from deeptutor.knowledge.manager import KnowledgeBaseManager
         from deeptutor.services.partners.workspace import (
             apply_kb_strategy,
+            ensure_partner_workspace,
             read_partner_config,
         )
-        from deeptutor.services.path_service import get_path_service
         from deeptutor.services.rag.service import RAGService
 
-        kb_root = get_path_service().get_knowledge_bases_root()
+        kb_root = ensure_partner_workspace(partner_id) / "knowledge_bases"
         if not kb_root.is_dir():
-            logger.info("[sale_chat.kb] no kb_root dir, skip retrieval")
+            logger.info("[sale_chat.kb] no kb_root dir at %s, skip retrieval", kb_root)
             return "", 0.0
         kb_names = apply_kb_strategy(
             KnowledgeBaseManager(base_dir=str(kb_root)).list_knowledge_bases(),
