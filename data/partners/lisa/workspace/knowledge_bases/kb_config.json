@@ -1,0 +1,36 @@
+{
+  "defaults": {
+    "default_kb": null,
+    "rag_provider": "llamaindex",
+    "search_mode": "hybrid",
+    "provider_modes": {
+      "lightrag": "mix"
+    }
+  },
+  "knowledge_bases": {
+    "knowledge_feishu_v1": {
+      "path": "knowledge_feishu_v1",
+      "type": "qdrant",
+      "rag_provider": "qdrant",
+      "host": "127.0.0.1",
+      "port": 6333,
+      "collection_name": "knowledge_feishu_v1",
+      "vector_name": "",
+      "description": "飞书知识库 - 雪梨英语",
+      "status": "ready",
+      "needs_reindex": false
+    },
+    "knowledge_faq_v1": {
+      "path": "knowledge_faq_v1",
+      "type": "qdrant",
+      "rag_provider": "qdrant",
+      "host": "127.0.0.1",
+      "port": 6333,
+      "collection_name": "knowledge_faq_v1",
+      "vector_name": "",
+      "description": "FAQ 话术知识库 - 雪梨英语",
+      "status": "ready",
+      "needs_reindex": false
+    }
+  }
+}
