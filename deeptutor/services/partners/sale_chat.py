@@ -615,25 +615,22 @@ async def _process_session_core(
                     session_id, len(image_urls), len(image_desc),
                 )
 
-        # ① Shirley 5.1: 拉完整画像 → 压缩成摘要给 system prompt 用
-        profile_summary = await _fetch_profile_summary(corpid, external_userid)
-
-        # ② Shirley 5.2: 拉对话历史
-        t0 = time.perf_counter()
-        history = await _fetch_history(corpid, external_userid, session_id)
-        logger.info(
-            "[sale_chat.history] session=%s | elapsed_ms=%d | history_turns=%d",
-            session_id, int((time.perf_counter() - t0) * 1000), len(history),
-        )
-
-        # ②.5 qdrant 知识库检索: 话术/知识弹药注入 system prompt
-        #     图片消息优先用识别出的描述去检索, 看图片内容能否匹配知识库
+        # ①②②.5 Shirley 画像+历史+QDrant 三者互不依赖, asyncio.gather 并行拉取
         kb_query = image_desc if image_desc else aggregated_text
-        t0 = time.perf_counter()
-        kb_context, kb_score = await _fetch_kb_context(kb_query)
+        t_fetch = time.perf_counter()
+        (
+            profile_summary,
+            history,
+            (kb_context, kb_score),
+        ) = await asyncio.gather(
+            _fetch_profile_summary(corpid, external_userid),
+            _fetch_history(corpid, external_userid, session_id),
+            _fetch_kb_context(kb_query),
+        )
         logger.info(
-            "[sale_chat.kb] session=%s | elapsed_ms=%d | kb_chars=%d | max_score=%.4f",
-            session_id, int((time.perf_counter() - t0) * 1000), len(kb_context), kb_score,
+            "[sale_chat.parallel_fetch] session=%s | total_ms=%d | history_turns=%d | kb_chars=%d | max_score=%.4f",
+            session_id, int((time.perf_counter() - t_fetch) * 1000),
+            len(history), len(kb_context), kb_score,
         )
 
         # 是否需要知识库支撑: 问题命中产品/课程类关键词才算"需要 KB 回答"。
@@ -812,66 +809,77 @@ async def _process_session_core(
             )
             return
 
-        # ⑤ 正常分支: LLM 回复（soul + 产品铁律 + qdrant 知识 + 画像摘要 注入）
-        t0 = time.perf_counter()
-        full_reply = await _llm_reply(
-            history, aggregated_text,
-            profile_summary=profile_summary, kb_context=kb_context,
+        # ⑤ 正常分支: LLM 流式回复 + 边收边推 (首句立即出, 不再等完整生成)
+        full_reply = await _stream_llm_and_push(
+            history=history,
+            aggregated=aggregated_text,
+            corpid=corpid,
+            external_userid=external_userid,
+            prime_info=prime_info,
+            profile_summary=profile_summary,
+            kb_context=kb_context,
         )
-        logger.info(
-            "[sale_chat.llm_reply] session=%s | elapsed_ms=%d | reply_chars=%d",
-            session_id, int((time.perf_counter() - t0) * 1000), len(full_reply or ""),
-        )
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("[sale_chat.llm_reply] session=%s | reply=%s", session_id, (full_reply or "")[:400])
 
-        # ⑥ 追加 sales service 的 action_text（直播链接等）
+        # ⑤.5 兜底: LLM 流式完全没出字 → 推兜底话术
         final_reply = (full_reply or "").strip()
         trace_outcome.llm_empty = not final_reply
+        if not final_reply:
+            try:
+                await _push_sentences(
+                    corpid=corpid,
+                    external_userid=external_userid,
+                    prime_info=prime_info,
+                    text=_FALLBACK_REPLY,
+                )
+                final_reply = _FALLBACK_REPLY
+                logger.warning(
+                    "[sale_chat.fallback] session=%s | LLM returned empty, using fallback reply",
+                    session_id,
+                )
+            except Exception as fb_err:
+                logger.warning("[sale_chat.fallback_push] session=%s | FAILED=%s", session_id, fb_err)
+
+        # ⑥ 追加 sales service 的 action_text (直播链接等), 流式结束后再追加推
         if action_text:
             final_reply += action_text
-            logger.info(
-                "[sale_chat.sales_action] session=%s | appended %d chars",
-                session_id, len(action_text),
-            )
+            try:
+                await _push_sentences(
+                    corpid=corpid,
+                    external_userid=external_userid,
+                    prime_info=prime_info,
+                    text=action_text,
+                )
+                logger.info(
+                    "[sale_chat.sales_action_push] session=%s | pushed %d chars",
+                    session_id, len(action_text),
+                )
+            except Exception as act_err:
+                logger.warning("[sale_chat.sales_action_push] session=%s | FAILED=%s", session_id, act_err)
 
-        # ⑥.1 LLM 意图识别: 回复中含 [LIVE_LINK] 标记 → 调 MCP 拉取最新直播链接替换
-        if _LIVE_LINK_MARKER in final_reply:
+        # ⑥.1 LLM 意图识别: 流式回复里含 [LIVE_LINK] 标记 → 调 MCP 拉取真实链接追加推
+        if _LIVE_LINK_MARKER in full_reply:
             logger.info("[sale_chat.live_request] session=%s | LLM emitted [LIVE_LINK] marker", session_id)
             live_text = await _fetch_live_link_direct(prime_info, external_userid)
             if live_text:
                 final_reply = final_reply.replace(_LIVE_LINK_MARKER, live_text.strip())
-                logger.info(
-                    "[sale_chat.live_request] session=%s | replaced marker with %d chars",
-                    session_id, len(live_text),
-                )
+                try:
+                    await _push_sentences(
+                        corpid=corpid,
+                        external_userid=external_userid,
+                        prime_info=prime_info,
+                        text=live_text.strip(),
+                    )
+                    logger.info(
+                        "[sale_chat.live_request_push] session=%s | pushed %d chars",
+                        session_id, len(live_text),
+                    )
+                except Exception as live_err:
+                    logger.warning("[sale_chat.live_request_push] session=%s | FAILED=%s", session_id, live_err)
             else:
-                # MCP 没拉到链接，去掉标记，避免用户看到
                 final_reply = final_reply.replace(_LIVE_LINK_MARKER, "")
                 logger.warning("[sale_chat.live_request] session=%s | MCP returned no live url, marker removed", session_id)
 
-        # ⑥.5 兜底: LLM 挂了也必须推一句, 保证 reply_lisa_message 一定被调用
-        if not final_reply:
-            final_reply = _FALLBACK_REPLY
-            logger.warning(
-                "[sale_chat.fallback] session=%s | LLM returned empty, using fallback reply",
-                session_id,
-            )
-
         trace_outcome.reply = final_reply.strip()
-
-        # ⑦ 逐句推送
-        t0 = time.perf_counter()
-        await _push_sentences(
-            corpid=corpid,
-            external_userid=external_userid,
-            prime_info=prime_info,
-            text=final_reply.strip(),
-        )
-        logger.info(
-            "[sale_chat.push_sentences] session=%s | elapsed_ms=%d | DONE",
-            session_id, int((time.perf_counter() - t0) * 1000),
-        )
 
         # ⑧ Shirley 5.3: 把本轮 sales 判定的 intent_level + 画像分析写回
         await _analyze_and_save_profile(
@@ -986,6 +994,188 @@ def _build_system_prompt(
         parts.append(f"\n\n{profile_summary}")
     parts.append(_NO_TOOL_RULE)
     return "".join(parts)
+
+
+# 流式切句的硬终止符 (与 sentence_split._HARD_TERMINATORS 保持一致)
+_STREAM_SENTENCE_END_RE = re.compile(r'[。！？.!?\n]')
+
+
+def _find_stream_sentence_end(text: str) -> int | None:
+    """在 LLM 流式累积文本中找到第一个完整句子的结束位置。
+
+    返回终止符字符本身的 index, 没找到返回 None。
+    """
+    m = _STREAM_SENTENCE_END_RE.search(text)
+    if m:
+        return m.end() - 1
+    return None
+
+
+async def _stream_llm_and_push(
+    *,
+    history: list[dict[str, str]],
+    aggregated: str,
+    corpid: str,
+    external_userid: str,
+    prime_info: dict[str, Any],
+    profile_summary: str = "",
+    kb_context: str = "",
+) -> str:
+    """流式调 LLM, 边收 chunk 边检测完整句子, 立即推送.
+
+    返回累积的完整文本 (用于后续 action_text 追加和 [LIVE_LINK] 标记处理).
+    首句在流式过程中就已推到家长微信, 不再等完整生成.
+    """
+    t0 = time.perf_counter()
+    from deeptutor.observability.agent_monitor import mark_mcp_failed
+    from deeptutor.services.llm import get_llm_client
+    from deeptutor.services.llm import factory as llm_factory
+
+    llm = get_llm_client()
+    cfg = llm.config
+
+    system_prompt = _build_system_prompt(profile_summary, kb_context=kb_context)
+
+    clean_history: list[dict[str, str]] = []
+    for h in history:
+        role = h.get("role", "user")
+        if role not in ("user", "assistant", "system"):
+            role = "user"
+        content = h.get("content", "")
+        if content:
+            clean_history.append({"role": role, "content": content})
+
+    messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    messages.extend(clean_history)
+    messages.append({"role": "user", "content": aggregated})
+
+    third_uuid = str(prime_info.get("thirdSaleUuid") or "")
+    third_uid = prime_info.get("thirdUserId")
+    if third_uid is not None:
+        try:
+            third_uid = int(third_uid)
+        except (TypeError, ValueError):
+            third_uid = None
+
+    logger.info(
+        "[sale_chat._stream_llm_and_push →] soul_chars=%d | history_turns=%d "
+        "| prompt_chars=%d | msgs=%d",
+        len(system_prompt), len(clean_history), len(aggregated), len(messages),
+    )
+
+    full_parts: list[str] = []
+    sentence_buffer: list[str] = []
+    sentence_count = 0
+    in_think_block = False
+
+    try:
+        async for chunk in llm_factory.stream(
+            aggregated,
+            system_prompt=system_prompt,
+            model=cfg.model,
+            api_key=cfg.api_key,
+            base_url=cfg.base_url,
+            api_version=getattr(cfg, "api_version", None),
+            binding=getattr(cfg, "binding", "openai"),
+            reasoning_effort=getattr(cfg, "reasoning_effort", None),
+            extra_headers=getattr(cfg, "extra_headers", None),
+            messages=messages,
+        ):
+            if chunk == "<think>":
+                in_think_block = True
+                continue
+            if chunk == "</think>":
+                in_think_block = False
+                continue
+            if in_think_block:
+                continue
+            if not chunk:
+                continue
+
+            full_parts.append(chunk)
+            sentence_buffer.append(chunk)
+
+            buffer_text = "".join(sentence_buffer)
+            while True:
+                end_idx = _find_stream_sentence_end(buffer_text)
+                if end_idx is None:
+                    break
+
+                sentence = buffer_text[: end_idx + 1].strip()
+                buffer_text = buffer_text[end_idx + 1:]
+                sentence_buffer = [buffer_text] if buffer_text else []
+
+                if sentence:
+                    if _LIVE_LINK_MARKER in sentence:
+                        logger.debug("[sale_chat.stream_push] skip LIVE_LINK marker | raw=%r", sentence)
+                        continue
+                    safe_sentence = _strip_tool_calls(sentence)
+                    if safe_sentence:
+                        sentence_count += 1
+                        try:
+                            await qywx.send_lisa_message(
+                                corpid=corpid,
+                                external_userid=external_userid,
+                                msg_text=safe_sentence,
+                                third_sale_uuid=third_uuid or None,
+                                third_user_id=third_uid,
+                                msg_type=qywx._MSG_TYPE_TEXT,
+                                disable_dedup=True,
+                                original_user_id=str(prime_info.get("originalUserId") or "") or None,
+                                customer_name=str(prime_info.get("customerName") or "") or None,
+                                qywx_userid=str(prime_info.get("qywxUserid") or "") or None,
+                                is_prod=prime_info.get("isProd"),
+                            )
+                            logger.info(
+                                "[sale_chat.stream_push] OK | idx=%d | chars=%d",
+                                sentence_count, len(safe_sentence),
+                            )
+                        except Exception as push_err:
+                            mark_mcp_failed()
+                            logger.warning(
+                                "[sale_chat.stream_push] FAIL | idx=%d | err=%s | text=%s",
+                                sentence_count, push_err, safe_sentence[:80],
+                            )
+    except Exception as stream_err:
+        logger.error(
+            "[sale_chat._stream_llm_and_push] FAILED | elapsed_ms=%d | err=%s",
+            int((time.perf_counter() - t0) * 1000), stream_err, exc_info=True,
+        )
+
+    tail = "".join(sentence_buffer).strip()
+    if tail and _LIVE_LINK_MARKER not in tail:
+        safe_tail = _strip_tool_calls(tail)
+        if safe_tail:
+            sentence_count += 1
+            try:
+                await qywx.send_lisa_message(
+                    corpid=corpid,
+                    external_userid=external_userid,
+                    msg_text=safe_tail,
+                    third_sale_uuid=third_uuid or None,
+                    third_user_id=third_uid,
+                    msg_type=qywx._MSG_TYPE_TEXT,
+                    disable_dedup=True,
+                    original_user_id=str(prime_info.get("originalUserId") or "") or None,
+                    customer_name=str(prime_info.get("customerName") or "") or None,
+                    qywx_userid=str(prime_info.get("qywxUserid") or "") or None,
+                    is_prod=prime_info.get("isProd"),
+                )
+                logger.info(
+                    "[sale_chat.stream_tail] OK | chars=%d", len(safe_tail),
+                )
+            except Exception as push_err:
+                mark_mcp_failed()
+                logger.warning(
+                    "[sale_chat.stream_tail] FAIL | err=%s", push_err,
+                )
+
+    full_reply = "".join(full_parts).strip()
+    logger.info(
+        "[sale_chat._stream_llm_and_push] elapsed_ms=%d | full_chars=%d | sentences=%d",
+        int((time.perf_counter() - t0) * 1000), len(full_reply), sentence_count,
+    )
+    return full_reply
 
 
 async def _llm_reply(
