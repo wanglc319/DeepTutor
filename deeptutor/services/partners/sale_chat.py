@@ -41,8 +41,9 @@ from deeptutor.services.shirley import qywx
 logger = logging.getLogger(__name__)
 
 DEBOUNCE_SECONDS = 10.0
-TYPING_BASE_DELAY = 0.7
-TYPING_PER_CHAR = 1.3
+TYPING_BASE_DELAY = 0.25
+TYPING_PER_CHAR = 0.04
+TYPING_MAX_DELAY = 1.2
 
 # 动态 soul 的 partner_id: 从 data/partners/<id>/workspace/user/workspace/SOUL.md 读取
 # 后台改完 SOUL.md 下一轮对话立即生效, 无需重启
@@ -1067,6 +1068,9 @@ async def _stream_llm_and_push(
     sentence_buffer: list[str] = []
     sentence_count = 0
     in_think_block = False
+    typing_delay = TypingDelay(
+        base=TYPING_BASE_DELAY, per_char=TYPING_PER_CHAR, max_delay=TYPING_MAX_DELAY,
+    )
 
     try:
         async for chunk in llm_factory.stream(
@@ -1112,6 +1116,12 @@ async def _stream_llm_and_push(
                     safe_sentence = _strip_tool_calls(sentence)
                     if safe_sentence:
                         sentence_count += 1
+                        sleep_for = typing_delay.for_sentence(safe_sentence)
+                        logger.info(
+                            "[sale_chat.stream_typing] idx=%d | chars=%d | sleep=%.2fs",
+                            sentence_count, len(safe_sentence), sleep_for,
+                        )
+                        await asyncio.sleep(sleep_for)
                         try:
                             await qywx.send_lisa_message(
                                 corpid=corpid,
@@ -1147,6 +1157,12 @@ async def _stream_llm_and_push(
         safe_tail = _strip_tool_calls(tail)
         if safe_tail:
             sentence_count += 1
+            sleep_for = typing_delay.for_sentence(safe_tail)
+            logger.info(
+                "[sale_chat.stream_tail_typing] idx=%d | chars=%d | sleep=%.2fs",
+                sentence_count, len(safe_tail), sleep_for,
+            )
+            await asyncio.sleep(sleep_for)
             try:
                 await qywx.send_lisa_message(
                     corpid=corpid,
@@ -1334,7 +1350,7 @@ async def _push_sentences(
         except (TypeError, ValueError):
             third_uid = None
 
-    delay = TypingDelay(base=TYPING_BASE_DELAY, per_char=TYPING_PER_CHAR, max_delay=30.0)
+    delay = TypingDelay(base=TYPING_BASE_DELAY, per_char=TYPING_PER_CHAR, max_delay=TYPING_MAX_DELAY)
     first = True
     idx = 0
     for s in sentences:
