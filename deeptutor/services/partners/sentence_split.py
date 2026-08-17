@@ -183,21 +183,22 @@ def split_sentences(text: str) -> list[str]:
 class TypingDelay:
     """Compute the delay before sending the next sentence.
 
-    Calibrated so the total answer is ~12-15 字/秒 — faster than a human
-    typist but slow enough to feel natural (not a bot dump).
-    Typical range with ``base=0.30, per_char=0.08``:
+    Calibrated to feel like a real Chinese typist on pinyin input
+    (~5 字/秒 for a reasonably-skilled person — slower than shorthand
+    but faster than hunting-and-pecking). Typical range with
+    ``base=0.40, per_char=0.20``:
 
     +---------+---------------+
-    | 10 字   |  ~1.10s       |
-    | 20 字   |  ~1.90s       |
-    | 30 字   |  ~2.40s (capped at 2.0s) |
+    | 10 字   |  ~2.40s       |
+    | 20 字   |  ~4.40s       |
+    | 30 字   |  ~5.00s (cap) |
     +---------+---------------+
     """
 
-    base: float = 0.30
-    per_char: float = 0.08
-    min_delay: float = 0.20
-    max_delay: float = 2.0
+    base: float = 0.40
+    per_char: float = 0.20
+    min_delay: float = 0.30
+    max_delay: float = 5.0
 
     def for_sentence(self, sentence: str) -> float:
         if not sentence:
