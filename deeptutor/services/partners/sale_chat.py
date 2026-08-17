@@ -432,7 +432,7 @@ def _strip_live_links(text: str) -> str:
         return text
     cleaned = _LIVE_LINK_RE.sub("[直播链接已移除，请从系统获取最新链接]", text)
     # 清理可能残留的空 markdown 链接 [文字]()
-    cleaned = _re_mod.sub(r'\[([^\]]*)\]\(\s*\)', r'\1', cleaned)
+    cleaned = re.sub(r'\[([^\]]*)\]\(\s*\)', r'\1', cleaned)
     return cleaned
 
 
@@ -1090,7 +1090,8 @@ async def _process_session_core(
             # ⑤.6 补偿链路 (fire-and-forget): 延迟重试一次 LLM,
             #     重试成功 → 推送真实回复; 仍失败 → 推 msgType=119 转人工,
             #     保证"稍等一下"之后一定还有后续 (不再让客户干等).
-            asyncio.create_task(
+            #     注意: task 必须存入 _BACKGROUND_TASKS 持强引用, 否则会被 GC 回收.
+            _retry_task = asyncio.create_task(
                 _fallback_retry_and_escalate(
                     session_id=session_id,
                     history=history,
@@ -1104,6 +1105,8 @@ async def _process_session_core(
                     pg_conv_id=pg_conv_id,
                 )
             )
+            _BACKGROUND_TASKS.add(_retry_task)
+            _retry_task.add_done_callback(_BACKGROUND_TASKS.discard)
 
         # ⑥ 追加 sales service 的 action_text (直播链接等), 流式结束后再追加推
         if action_text:
@@ -1181,6 +1184,10 @@ _FALLBACK_REPLY = "稍等一下哦，我这边看看～"
 
 # 兜底触发后的补偿重试延迟 (秒): 等网关瞬时故障恢复 + 模拟真人查看耗时
 _FALLBACK_RETRY_DELAY = float(os.getenv("SALE_CHAT_FALLBACK_RETRY_DELAY", "15.0"))
+
+# 后台任务强引用: event loop 对 task 只持弱引用, 不保存引用会被 GC 静默回收
+# (官方文档要求模式), 导致补偿任务随机消失.
+_BACKGROUND_TASKS: set[asyncio.Task] = set()
 
 # msgType=101 表示客户发的是图片消息（content 为图片 URL）
 _MSG_TYPE_IMAGE = 101
