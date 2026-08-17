@@ -171,30 +171,43 @@ LLM_TAG_SYSTEM_PROMPT = f"""你是一个专业的销售意向分析助手。根�
 
 
 async def llm_tag(text: str, llm_client: Any) -> tuple[dict[str, bool], dict[str, str], dict[str, Any]]:
-    """调用 LLM 做语义打标签。返回 (signals, source, profile)."""
-    import asyncio
+    """调用 LLM 做语义打标签。返回 (signals, source, profile).
 
-    payload = {
-        "model": getattr(llm_client, "model", getattr(llm_client, "MODEL", "qwen3.7-flash")),
-        "messages": [
-            {"role": "system", "content": LLM_TAG_SYSTEM_PROMPT},
-            {"role": "user",   "content": f"客户消息：{text}"},
-        ],
-        "temperature": 0.1,
-        "response_format": {"type": "json_object"},
-    }
-    # 兼容 DeepTutor 的 llm_client（可能有 .chat.completions.create，也可能是 aiohttp session）
-    try:
-        resp = await llm_client.chat.completions.create(**payload)
-        content = resp.choices[0].message.content
-    except Exception:
-        # 兜底：简单同步（如果在非 async 上下文）
+    自动探测 client 类型:
+      - DeepTutor LLMClient (有 .complete() 方法) → 用它
+      - OpenAI SDK 兼容 client (有 .chat.completions.create) → 退化路径
+    """
+    # ── 路径 A: DeepTutor LLMClient (async complete(prompt, system_prompt) -> str) ──
+    if hasattr(llm_client, "complete") and callable(getattr(llm_client, "complete")):
         try:
-            resp = llm_client.chat.completions.create(**payload)
-            content = resp.choices[0].message.content
+            content = await llm_client.complete(
+                prompt=f"客户消息：{text}",
+                system_prompt=LLM_TAG_SYSTEM_PROMPT,
+            )
         except Exception as exc:
-            logger.warning("llm_tag fallback failed: %s", exc)
+            logger.warning("llm_tag via LLMClient failed: %s", exc)
             return {}, {}, {}
+    else:
+        # ── 路径 B: OpenAI SDK 兼容路径 (原始实现) ──
+        payload = {
+            "model": getattr(llm_client, "model", getattr(llm_client, "MODEL", "qwen3.7-flash")),
+            "messages": [
+                {"role": "system", "content": LLM_TAG_SYSTEM_PROMPT},
+                {"role": "user",   "content": f"客户消息：{text}"},
+            ],
+            "temperature": 0.1,
+            "response_format": {"type": "json_object"},
+        }
+        try:
+            resp = await llm_client.chat.completions.create(**payload)
+            content = resp.choices[0].message.content
+        except Exception:
+            try:
+                resp = llm_client.chat.completions.create(**payload)
+                content = resp.choices[0].message.content
+            except Exception as exc:
+                logger.warning("llm_tag via OpenAI SDK failed: %s", exc)
+                return {}, {}, {}
 
     try:
         obj = json.loads(content)

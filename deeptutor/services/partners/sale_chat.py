@@ -642,12 +642,14 @@ async def _process_session_core(
         # ③ sales.service: 打标签 + 算温度档 + 判定 explicit_refusal + next_action
         #    这步内部会跑 LLM tagger + regex 补漏，比单独 LLM 拒绝判断更精确
         from deeptutor.sales import service as sales_service
+        from deeptutor.services.llm import get_llm_client
         t0 = time.perf_counter()
         try:
             cust_profile, action_text = await sales_service.process_customer_message(
                 customer_msg=aggregated_text,
                 customer_external_id=external_userid,
                 corpid=corpid,
+                llm_client=get_llm_client(),
                 qywx_userid=str(prime_info.get("qywxUserid") or "") or None,
                 qywx_userid_fallback=str(prime_info.get("qywxUserid") or "") or None,
                 third_sale_uuid_fallback=str(prime_info.get("thirdSaleUuid") or "") or None,
