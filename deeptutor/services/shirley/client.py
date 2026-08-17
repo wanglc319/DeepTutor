@@ -2,12 +2,18 @@
 Shirley MCP Streamable HTTP Client
 ==================================
 
-所有 Shirley MCP 工具调用的底层入口。封装了 MCP 会话生命周期、
-错误检查、超时重试。上层 Skill（profile / live / qywx）只调
-:func:`call_tool`，不用关心 Streamable HTTP 细节。
+所有 Shirley MCP 工具调用的底层入口。封装了错误检查、超时重试。
+上层 Skill（profile / live / qywx）只调 :func:`call_tool`，不用关心细节。
+
+连接复用策略（关键性能点）:
+  - httpx.AsyncClient 单例，全局共享连接池，避免每次重建 TCP/TLS
+  - Shirley 网关是无状态的 — 不需要 initialize / notifications/initialized，
+    也不需要 mcp-session-id。直接 tools/call 一次往返就能拿到结果。
+  - 之前每 call_tool 走 3 次 HTTP 往返（init + init'd + call），
+    优化后只有 1 次。一轮 saleChat 约 9 次 call_tool，省掉 18 次额外往返 + 9 次 TCP/TLS。
 
 MCP 服务地址: https://prod-shirley-gateway.xueliyingyu.com/ai/mcp
-协议: Streamable HTTP (jsonrpc 2.0)
+协议: Streamable HTTP (jsonrpc 2.0) 无状态实现
 """
 from __future__ import annotations
 
@@ -28,9 +34,6 @@ SHIRLEY_MCP_URL = os.getenv(
 )
 SHIRLEY_TIMEOUT = float(os.getenv("SHIRLEY_TIMEOUT", "30"))
 SHIRLEY_API_TOKEN = os.getenv("SHIRLEY_API_TOKEN", "")
-
-_PROTOCOL_VERSION = "2025-03-26"
-_CLIENT_INFO = {"name": "deeptutor", "version": "2.0"}
 
 _MAX_LOG_LEN = 400
 
@@ -60,6 +63,37 @@ class ShirleyMCPNetworkError(ShirleyMCPError):
     """网络层失败（连接超时、HTTP 5xx 等）。"""
 
 
+# ─────────────────────────────────────────────────────────────
+# httpx.AsyncClient 单例（连接池复用，省 TCP/TLS 握手）
+# ─────────────────────────────────────────────────────────────
+
+_client: httpx.AsyncClient | None = None
+
+
+def _get_client() -> httpx.AsyncClient:
+    """httpx.AsyncClient 单例。首次调用时创建，后续一直复用连接池。"""
+    global _client
+    if _client is None:
+        _client = httpx.AsyncClient(
+            timeout=SHIRLEY_TIMEOUT,
+            verify=False,
+            limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+            },
+        )
+        logger.info("[Shirley MCP] 初始化 AsyncClient 单例")
+    return _client
+
+
+def _auth_headers() -> dict[str, str]:
+    headers: dict[str, str] = {}
+    if SHIRLEY_API_TOKEN:
+        headers["Authorization"] = f"Bearer {SHIRLEY_API_TOKEN}"
+    return headers
+
+
 async def call_tool(tool_name: str, arguments: dict[str, Any]) -> Any:
     """调用任意 Shirley MCP 工具，返回解析后的 JSON 结果。
 
@@ -86,62 +120,30 @@ async def call_tool(tool_name: str, arguments: dict[str, Any]) -> Any:
 
 
 async def _call_tool(tool_name: str, arguments: dict[str, Any]) -> Any:
-    """执行 Shirley MCP 工具调用。"""
+    """执行 Shirley MCP 工具调用。
+
+    Shirley 网关是无状态的，直接发 tools/call 就行，不用 initialize。
+    """
     t0 = time.perf_counter()
     logger.info("[Shirley MCP →] %s | args=%s", tool_name, _snippet(arguments))
 
-    url = SHIRLEY_MCP_URL
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json, text/event-stream",
-    }
-    if SHIRLEY_API_TOKEN:
-        headers["Authorization"] = f"Bearer {SHIRLEY_API_TOKEN}"
-
     try:
-        async with httpx.AsyncClient(timeout=SHIRLEY_TIMEOUT, verify=False) as c:
-            # --- 1. Initialize ---
-            init_resp = await c.post(
-                url,
-                json={
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "initialize",
-                    "params": {
-                        "protocolVersion": _PROTOCOL_VERSION,
-                        "capabilities": {},
-                        "clientInfo": _CLIENT_INFO,
-                    },
-                },
-                headers=headers,
-            )
-            init_resp.raise_for_status()
-            session_id = init_resp.headers.get("mcp-session-id")
-            if session_id:
-                headers["mcp-session-id"] = session_id
+        client = _get_client()
 
-            # --- 2. Initialized notification ---
-            await c.post(
-                url,
-                json={"jsonrpc": "2.0", "method": "notifications/initialized"},
-                headers=headers,
-            )
+        call_resp = await client.post(
+            SHIRLEY_MCP_URL,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": tool_name, "arguments": arguments},
+            },
+            headers=_auth_headers(),
+        )
+        call_resp.raise_for_status()
+        raw = call_resp.json()
 
-            # --- 3. Call tool ---
-            call_resp = await c.post(
-                url,
-                json={
-                    "jsonrpc": "2.0",
-                    "id": 2,
-                    "method": "tools/call",
-                    "params": {"name": tool_name, "arguments": arguments},
-                },
-                headers=headers,
-            )
-            call_resp.raise_for_status()
-            raw = call_resp.json()
-
-        # --- 4. Check JSON-RPC error ---
+        # --- JSON-RPC error 处理 ---
         if "error" in raw:
             err = raw["error"]
             elapsed_ms = int((time.perf_counter() - t0) * 1000)
@@ -153,7 +155,7 @@ async def _call_tool(tool_name: str, arguments: dict[str, Any]) -> Any:
 
         result = raw.get("result") or {}
 
-        # --- 5. Check MCP isError ---
+        # --- MCP isError 处理 ---
         if result.get("isError"):
             content = result.get("content") or []
             err_text = ""
@@ -170,7 +172,7 @@ async def _call_tool(tool_name: str, arguments: dict[str, Any]) -> Any:
                 f"[{tool_name}] tool-level error: {err_text or result}"
             )
 
-        # --- 6. Parse content ---
+        # --- 解析 content ---
         content = result.get("content") or []
         parsed: Any
         if not content:

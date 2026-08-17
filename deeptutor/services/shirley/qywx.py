@@ -60,7 +60,8 @@ async def get_customer_detail(
     """
     if not corpid or not external_userid:
         return None
-    if resolved is None:
+    # 调用方如果已传所需字段就跳过 resolve_all（避免重复 get_user_profile）
+    if resolved is None and not third_user_id:
         resolved = await resolve_all(corpid, external_userid)
 
     tuid = third_user_id or resolved.third_user_id
@@ -102,6 +103,7 @@ async def query_chat_history_via_3(
     """
     if not corpid or not external_userid:
         return None
+    # 调用方如果已传所需字段就跳过 resolve_all（避免重复 get_user_profile）
     if resolved is None:
         resolved = await resolve_all(corpid, external_userid)
 
@@ -156,7 +158,8 @@ async def mark_tags(
             logger.info("mark_tags: 幂等命中，跳过 tag_ids=%s", tag_ids)
             return {"ok": True, "skipped_dedup": True, "tagIds": tag_ids}
 
-    if resolved is None:
+    # mark_tags: follow_userid 已传就不用 resolve_all
+    if resolved is None and not follow_userid:
         resolved = await resolve_all(corpid, external_userid)
 
     # 如果没显式传 follow_userid，用 resolved.primary_follow_userid 或第一个
@@ -247,10 +250,12 @@ async def send_lisa_message(
             logger.info("send_lisa_message: 幂等命中，跳过")
             return {"ok": True, "skipped_dedup": True}
 
-    if resolved is None:
+    # 调用方如果已传 third_sale_uuid + third_user_id，就跳过 resolve_all
+    # （逐句推送时每句都调 resolve_all 会重复打 get_user_profile）
+    if resolved is None and not (third_sale_uuid and third_user_id):
         resolved = await resolve_all(corpid, external_userid)
 
-    third_uuid = third_sale_uuid or resolved.third_sale_uuid or ""
+    third_uuid = third_sale_uuid or (resolved.third_sale_uuid if resolved else None) or ""
     third_uid = int(third_user_id or resolved.third_user_id or 0) or 0
 
     payload: dict[str, Any] = {
