@@ -8,10 +8,14 @@ Sale Chat HTTP 路由
 请求进来立即返回 200 + ok=true；实际业务逻辑（10s debounce 聚合 → LLM →
 逐句 MCP 6 推送）跑在后台 asyncio.Task 里。
 
+特殊分支: reqType=welcome —— 买家首次触发的雪梨老师欢迎语，
+不走 debounce 10s 聚合、不走 LLM，直接把请求里的 content 推送出去。
+
 文档对应: https://jcnmgzcga30e.feishu.cn/file/Fdx3bQbkWoFcZbxkYnjcBqjvnbS
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import Any
@@ -99,7 +103,42 @@ async def sale_chat_endpoint(payload: SaleChatRequest) -> dict[str, Any]:
         "received_at": __import__("time").time(),
     }
 
-    # 2. 进 debounce 队列（立即返回）
+    # ── welcome 分支：雪梨老师欢迎语，跳过 10s debounce + 跳过 LLM ──
+    if payload.reqType == "welcome":
+        try:
+            from deeptutor.services.partners import sale_chat as sale_chat_svc
+            asyncio.create_task(
+                sale_chat_svc._push_sentences(
+                    corpid=corpid,
+                    external_userid=external_userid,
+                    prime_info=prime_info,
+                    text=content,
+                )
+            )
+            logger.info(
+                "[sale_chat.welcome] session=%s | content_chars=%d | 跳过 debounce/LLM 直接推送",
+                session_id, len(content),
+            )
+        except Exception as e:
+            logger.exception("[sale_chat.welcome] push 启动失败: %s", e)
+            return {
+                "partner_id": "lisa",
+                "ok": False,
+                "error": f"welcome push failed: {e}",
+                "session_id": session_id,
+            }
+
+        return {
+            "partner_id": "lisa",
+            "ok": True,
+            "session_id": session_id,
+            "corpid": corpid,
+            "req_type": "welcome",
+            "push_direct": True,
+            "received": payload.model_dump(by_alias=True),
+        }
+
+    # 2. 正常 chat 链路：进 debounce 队列（立即返回）
     try:
         from deeptutor.services.partners import sale_chat as sale_chat_svc
         await sale_chat_svc.enqueue(
