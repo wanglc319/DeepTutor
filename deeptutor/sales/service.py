@@ -35,11 +35,12 @@ async def process_customer_message(
     third_sale_uuid_fallback: str | None = None,
     third_user_id_fallback: int | None = None,
     vid_fallback: int | None = None,
+    _existing_cust_row: dict | None = None,
 ) -> tuple[CustomerProfile, str | None]:
     """处理一条客户消息。返回 (更新后的 profile, 要追加到 AI 回复的动作文本或 None).
 
     流程:
-      1. upsert customer → 拿已有 profile
+      1. upsert customer → 拿已有 profile (_existing_cust_row 传入时跳过, 由调用方已 upsert)
       2. LLM 打标签（优先，有 llm_client 就调）
       3. 正则兜底（LLM 失败/全空 或 force_regex=True 时触发，补 LLM 没覆盖到的标签）
       4. 合并 signals + profile + 算 delivery_q_count
@@ -48,11 +49,14 @@ async def process_customer_message(
       7. 写回 DB
     """
     # 1. 客户建档 / 读取
-    cust_row = await sales_db.upsert_customer(
-        external_id=customer_external_id,
-        channel=channel,
-        nickname=nickname,
-    )
+    if _existing_cust_row is not None:
+        cust_row = _existing_cust_row
+    else:
+        cust_row = await sales_db.upsert_customer(
+            external_id=customer_external_id,
+            channel=channel,
+            nickname=nickname,
+        )
     customer_id = str(cust_row["id"])
     raw_profile = cust_row.get("profile")
     if isinstance(raw_profile, str):

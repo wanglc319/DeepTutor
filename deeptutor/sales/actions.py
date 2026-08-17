@@ -14,8 +14,9 @@ from .schemas import (
     TEMP_BLAZING, TEMP_HOT, TEMP_WARM, TEMP_COOL, TEMP_COLD,
     DAY_GATE_3, DAY_GATE_7, DAY_GATE_10,
 )
-import os as _os_env
 from .temperature import compute_time_factor, compute_stop_loss
+import logging
+import os
 
 
 # 推送门槛：delivery_q_count（追问标签触发次数）≥ 2 时触发直播邀约
@@ -115,15 +116,12 @@ async def _get_live_url(
     拿不到就返回 None, 调用方跳过直播推送 —— 绝不回落到写死的链接。
     环境变量 SALES_LIVE_URL 仅作人工应急覆盖。
     """
-    import logging as _logging
-    import os as _os
-
-    _log = _logging.getLogger(__name__)
-    env_url = _os.getenv("SALES_LIVE_URL")
+    _log = logging.getLogger(__name__)
+    env_url = os.getenv("SALES_LIVE_URL")
     if env_url:
         return env_url
 
-    for cid in (corpid, _os.getenv("SHIRLEY_CORPID", "").strip()):
+    for cid in (corpid, os.getenv("SHIRLEY_CORPID", "").strip()):
         if not (cid and external_userid):
             continue
         try:

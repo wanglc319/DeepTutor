@@ -217,9 +217,11 @@ async def _pg_ensure_customer_conv(
     external_userid: str,
     nickname: str | None = None,
     partner_id: str = "lisa",
-) -> tuple[str, str] | None:
-    """upsert customer + upsert conversation (当天复用), 返回 (customer_id, conversation_id).
+) -> tuple[dict[str, Any], str] | None:
+    """upsert customer + upsert conversation (当天复用), 返回 (cust_row, conversation_id).
 
+    cust_row 包含完整 customers 表数据, 可直接传给 process_customer_message
+    的 _existing_cust_row 参数, 避免重复 upsert.
     PG 挂了不阻断对话, 返回 None 让调用方跳过 PG 记忆层, 继续走 Shirley 就行.
     """
     try:
@@ -231,7 +233,7 @@ async def _pg_ensure_customer_conv(
         )
         customer_id = str(cust["id"])
         conv_id = await sales_db.upsert_conversation(customer_id, partner_id=partner_id)
-        return customer_id, conv_id
+        return dict(cust), conv_id
     except Exception as e:
         logger.warning("[sale_chat.pg.memory] ensure customer/conv FAILED=%s", e)
         return None
@@ -413,12 +415,10 @@ async def _llm_summarize_chunk(
     return summary.strip(), key_points
 
 
-import re as _re_mod
-
 # 知识库中历史过期的直播回放链接（不可靠，不返回给用户）
-_LIVE_LINK_RE = _re_mod.compile(
+_LIVE_LINK_RE = re.compile(
     r'https?://[^\s<>"\')\]]*(?:shirleyclass\.com|live\.|h5\.|watch\.)[^\s<>"\')\]]*',
-    _re_mod.IGNORECASE,
+    re.IGNORECASE,
 )
 
 
@@ -817,12 +817,9 @@ async def _process_session_core(
         logger.debug("[sale_chat.process] session=%s | aggregated_text=%s", session_id, aggregated_text[:300])
 
     try:
-        # ── PG memory 层: 确保 customer + conversation 存在 ──────────
-        pg_conv_pair = await _pg_ensure_customer_conv(external_userid)
-        pg_conv_id = pg_conv_pair[1] if pg_conv_pair else None
-
-        # ⓪ 图片消息 (msgType=101): 多模态识别图片内容 → 描述注入, 供 KB 匹配 + LLM 回答
+        # ⓪ 图片识别 + PG ensure 互不依赖, 提前并行启动 (省 ~30-80ms)
         image_urls = _collect_image_urls(messages)
+        _pg_task = asyncio.create_task(_pg_ensure_customer_conv(external_userid))
         image_desc = ""
         if image_urls:
             image_desc = await _describe_images(image_urls)
@@ -833,7 +830,14 @@ async def _process_session_core(
                     session_id, len(image_urls), len(image_desc),
                 )
 
-        # ①②②.5 Shirley 画像+历史+QDrant 三者互不依赖, asyncio.gather 并行拉取
+        # PG ensure 结果 (提前启动, 此时大概率已完成)
+        pg_cust_row: dict[str, Any] | None = None
+        pg_conv_id: str | None = None
+        pg_pair = await _pg_task
+        if pg_pair:
+            pg_cust_row, pg_conv_id = pg_pair
+
+        # ①②②.5 Shirley 画像+历史+QDrant + PG history 合成四者互不依赖, gather 并行
         kb_query = image_desc if image_desc else aggregated_text
         t_fetch = time.perf_counter()
         (
@@ -888,6 +892,7 @@ async def _process_session_core(
                 third_sale_uuid_fallback=str(prime_info.get("thirdSaleUuid") or "") or None,
                 third_user_id_fallback=int(prime_info.get("thirdUserId")) if prime_info.get("thirdUserId") is not None else None,
                 vid_fallback=int(prime_info.get("vid")) if prime_info.get("vid") is not None else None,
+                _existing_cust_row=pg_cust_row,
             )
             elapsed_sales = int((time.perf_counter() - t0) * 1000)
             intent_temperature = getattr(cust_profile, "intent_temperature", "unknown")
@@ -1263,6 +1268,64 @@ def _find_stream_sentence_end(text: str) -> int | None:
     return None
 
 
+async def _push_one_sentence(
+    sentence: str,
+    *,
+    corpid: str,
+    external_userid: str,
+    prime_info: dict[str, Any],
+    third_uuid: str,
+    third_uid: int | None,
+    label: str,
+    idx: int | None = None,
+) -> bool:
+    """推一条清洗后的句子到 Shirley, 带 typing 延迟 + 统一的 log/error 处理.
+
+    返回 True=推送成功, False=推送失败.
+    """
+    from deeptutor.services.partners.sentence_split import TypingDelay
+    from deeptutor.observability.agent_monitor import mark_mcp_failed
+    from deeptutor.services.shirley import qywx
+
+    safe = _strip_tool_calls(sentence.strip())
+    if not safe or _LIVE_LINK_MARKER in safe:
+        return True
+
+    typing_delay = TypingDelay(
+        base=TYPING_BASE_DELAY, per_char=TYPING_PER_CHAR, max_delay=TYPING_MAX_DELAY,
+    )
+    sleep_for = typing_delay.for_sentence(safe)
+    tag = f"[{label}] idx={idx} | " if idx is not None else f"[{label}] "
+    logger.info(
+        f"[sale_chat.{label}_typing] chars=%d | sleep=%.2fs",
+        len(safe), sleep_for,
+    )
+    await asyncio.sleep(sleep_for)
+    try:
+        await qywx.send_lisa_message(
+            corpid=corpid,
+            external_userid=external_userid,
+            msg_text=safe,
+            third_sale_uuid=third_uuid or None,
+            third_user_id=third_uid,
+            msg_type=qywx._MSG_TYPE_TEXT,
+            disable_dedup=True,
+            original_user_id=str(prime_info.get("originalUserId") or "") or None,
+            customer_name=str(prime_info.get("customerName") or "") or None,
+            qywx_userid=str(prime_info.get("qywxUserid") or "") or None,
+            is_prod=prime_info.get("isProd"),
+        )
+        logger.info(f"[sale_chat.{label}_push] OK | {tag}chars=%d", len(safe))
+        return True
+    except Exception as push_err:
+        mark_mcp_failed()
+        logger.warning(
+            f"[sale_chat.{label}_push] FAIL | {tag}err=%s | text=%s",
+            push_err, safe[:80],
+        )
+        return False
+
+
 async def _stream_llm_and_push(
     *,
     history: list[dict[str, str]],
@@ -1326,9 +1389,6 @@ async def _stream_llm_and_push(
     sentence_buffer: list[str] = []
     sentence_count = 0
     in_think_block = False
-    typing_delay = TypingDelay(
-        base=TYPING_BASE_DELAY, per_char=TYPING_PER_CHAR, max_delay=TYPING_MAX_DELAY,
-    )
 
     try:
         async for chunk in llm_factory.stream(
@@ -1371,39 +1431,14 @@ async def _stream_llm_and_push(
                     if _LIVE_LINK_MARKER in sentence:
                         logger.debug("[sale_chat.stream_push] skip LIVE_LINK marker | raw=%r", sentence)
                         continue
-                    safe_sentence = _strip_tool_calls(sentence)
-                    if safe_sentence:
+                    if _strip_tool_calls(sentence):
                         sentence_count += 1
-                        sleep_for = typing_delay.for_sentence(safe_sentence)
-                        logger.info(
-                            "[sale_chat.stream_typing] idx=%d | chars=%d | sleep=%.2fs",
-                            sentence_count, len(safe_sentence), sleep_for,
+                        await _push_one_sentence(
+                            sentence,
+                            corpid=corpid, external_userid=external_userid,
+                            prime_info=prime_info, third_uuid=third_uuid,
+                            third_uid=third_uid, label="stream", idx=sentence_count,
                         )
-                        await asyncio.sleep(sleep_for)
-                        try:
-                            await qywx.send_lisa_message(
-                                corpid=corpid,
-                                external_userid=external_userid,
-                                msg_text=safe_sentence,
-                                third_sale_uuid=third_uuid or None,
-                                third_user_id=third_uid,
-                                msg_type=qywx._MSG_TYPE_TEXT,
-                                disable_dedup=True,
-                                original_user_id=str(prime_info.get("originalUserId") or "") or None,
-                                customer_name=str(prime_info.get("customerName") or "") or None,
-                                qywx_userid=str(prime_info.get("qywxUserid") or "") or None,
-                                is_prod=prime_info.get("isProd"),
-                            )
-                            logger.info(
-                                "[sale_chat.stream_push] OK | idx=%d | chars=%d",
-                                sentence_count, len(safe_sentence),
-                            )
-                        except Exception as push_err:
-                            mark_mcp_failed()
-                            logger.warning(
-                                "[sale_chat.stream_push] FAIL | idx=%d | err=%s | text=%s",
-                                sentence_count, push_err, safe_sentence[:80],
-                            )
     except Exception as stream_err:
         logger.error(
             "[sale_chat._stream_llm_and_push] FAILED | elapsed_ms=%d | err=%s",
@@ -1411,38 +1446,14 @@ async def _stream_llm_and_push(
         )
 
     tail = "".join(sentence_buffer).strip()
-    if tail and _LIVE_LINK_MARKER not in tail:
-        safe_tail = _strip_tool_calls(tail)
-        if safe_tail:
-            sentence_count += 1
-            sleep_for = typing_delay.for_sentence(safe_tail)
-            logger.info(
-                "[sale_chat.stream_tail_typing] idx=%d | chars=%d | sleep=%.2fs",
-                sentence_count, len(safe_tail), sleep_for,
-            )
-            await asyncio.sleep(sleep_for)
-            try:
-                await qywx.send_lisa_message(
-                    corpid=corpid,
-                    external_userid=external_userid,
-                    msg_text=safe_tail,
-                    third_sale_uuid=third_uuid or None,
-                    third_user_id=third_uid,
-                    msg_type=qywx._MSG_TYPE_TEXT,
-                    disable_dedup=True,
-                    original_user_id=str(prime_info.get("originalUserId") or "") or None,
-                    customer_name=str(prime_info.get("customerName") or "") or None,
-                    qywx_userid=str(prime_info.get("qywxUserid") or "") or None,
-                    is_prod=prime_info.get("isProd"),
-                )
-                logger.info(
-                    "[sale_chat.stream_tail] OK | chars=%d", len(safe_tail),
-                )
-            except Exception as push_err:
-                mark_mcp_failed()
-                logger.warning(
-                    "[sale_chat.stream_tail] FAIL | err=%s", push_err,
-                )
+    if tail and _LIVE_LINK_MARKER not in tail and _strip_tool_calls(tail):
+        sentence_count += 1
+        await _push_one_sentence(
+            tail,
+            corpid=corpid, external_userid=external_userid,
+            prime_info=prime_info, third_uuid=third_uuid,
+            third_uid=third_uid, label="stream_tail", idx=sentence_count,
+        )
 
     full_reply = "".join(full_parts).strip()
     logger.info(

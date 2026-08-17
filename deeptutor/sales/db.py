@@ -128,28 +128,27 @@ async def append_message(
     latency_ms: int | None = None,
     rag_hits: list[dict] | None = None,
 ) -> None:
+    """往 messages 插一条 + 更新 conversations.last_message_at, 1 次 roundtrip (CTE 合成)."""
     import json as _json
     pool = await get_pool()
-    # 先拿到当前 conv 的最大 seq
-    row = await pool.fetchrow(
-        "SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM messages WHERE conversation_id = $1",
-        conversation_id,
-    )
-    seq = row["next_seq"] if row else 1
-
     # asyncpg 对 jsonb 参数要求: 传 json.dumps 后的字符串, 不要直接 Python list/dict
     rag_json = _json.dumps(rag_hits or [], ensure_ascii=False)
 
     await pool.execute(
         """
-        INSERT INTO messages (conversation_id, sender, seq, content, llm_model, latency_ms, rag_hits)
-        VALUES ($1, $2::message_sender, $3, $4, $5, $6, $7::jsonb)
+        WITH next_seq AS (
+            SELECT COALESCE(MAX(seq), 0) + 1 AS s
+            FROM messages WHERE conversation_id = $1
+        ),
+        ins AS (
+            INSERT INTO messages (conversation_id, sender, seq, content, llm_model, latency_ms, rag_hits)
+            VALUES ($1, $2::message_sender, (SELECT s FROM next_seq), $3, $4, $5, $6::jsonb)
+            RETURNING conversation_id
+        )
+        UPDATE conversations SET last_message_at = now()
+        WHERE id = (SELECT conversation_id FROM ins)
         """,
-        conversation_id, sender, seq, content, llm_model, latency_ms, rag_json,
-    )
-    # 同步更新 conversation.last_message_at
-    await pool.execute(
-        "UPDATE conversations SET last_message_at = now() WHERE id = $1", conversation_id
+        conversation_id, sender, content, llm_model, latency_ms, rag_json,
     )
 
 
@@ -164,35 +163,31 @@ async def upsert_conversation(
 
     企微是"客户 → AI → 结束/挂起 → 回来继续"的模式, 同一天内同一个客户
     应该复用同一个 conversation, 而不是每次新开, 否则 messages 表就炸了.
+
+    CTE 合成 1 次 roundtrip: 先找 existing → UPDATE last_message_at,
+    没找到就 INSERT. 省掉原来 SELECT + UPDATE/INSERT 的 2 次往返.
     """
-    from datetime import date
     pool = await get_pool()
-    today = date.today()
     row = await pool.fetchrow(
         """
-        SELECT id FROM conversations
-        WHERE customer_id = $1
-          AND partner_id   = $2
-          AND opened_at::date = $3
-        ORDER BY opened_at DESC LIMIT 1
-        """,
-        customer_id, partner_id, today,
-    )
-    if row:
-        conv_id = str(row["id"])
-        await pool.execute(
-            "UPDATE conversations SET last_message_at = now() WHERE id = $1", conv_id
+        WITH existing AS (
+            SELECT id FROM conversations
+            WHERE customer_id = $1 AND partner_id = $2 AND opened_at::date = CURRENT_DATE
+            ORDER BY opened_at DESC LIMIT 1
+        ),
+        upd AS (
+            UPDATE conversations SET last_message_at = now()
+            WHERE id = (SELECT id FROM existing)
+            RETURNING id
         )
-        return conv_id
-    row = await pool.fetchrow(
-        """
         INSERT INTO conversations (customer_id, partner_id)
-        VALUES ($1, $2)
-        RETURNING id
+        SELECT $1, $2
+        WHERE NOT EXISTS (SELECT 1 FROM existing)
+        RETURNING id;
         """,
         customer_id, partner_id,
     )
-    return str(row["id"])
+    return str(row["id"]) if row else ""
 
 
 async def count_conv_messages(conversation_id: str) -> int:
