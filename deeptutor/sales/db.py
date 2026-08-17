@@ -168,6 +168,9 @@ async def upsert_conversation(
     没找到就 INSERT. 省掉原来 SELECT + UPDATE/INSERT 的 2 次往返.
     """
     pool = await get_pool()
+    # 注意: 主语句必须能同时取到 upd/ins 两个分支的 RETURNING ——
+    # 若主语句只是 INSERT ... RETURNING, 复用当天会话时 INSERT 不执行,
+    # fetchrow 返回 None → 调用方拿到 "" → PG 记忆层静默失效 (回归过).
     row = await pool.fetchrow(
         """
         WITH existing AS (
@@ -179,11 +182,17 @@ async def upsert_conversation(
             UPDATE conversations SET last_message_at = now()
             WHERE id = (SELECT id FROM existing)
             RETURNING id
+        ),
+        ins AS (
+            INSERT INTO conversations (customer_id, partner_id)
+            SELECT $1, $2
+            WHERE NOT EXISTS (SELECT 1 FROM existing)
+            RETURNING id
         )
-        INSERT INTO conversations (customer_id, partner_id)
-        SELECT $1, $2
-        WHERE NOT EXISTS (SELECT 1 FROM existing)
-        RETURNING id;
+        SELECT id FROM upd
+        UNION ALL
+        SELECT id FROM ins
+        LIMIT 1;
         """,
         customer_id, partner_id,
     )
