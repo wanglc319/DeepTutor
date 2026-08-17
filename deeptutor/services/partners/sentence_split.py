@@ -181,30 +181,35 @@ def split_sentences(text: str) -> list[str]:
 
 @dataclass
 class TypingDelay:
-    """Compute the delay before sending the next sentence.
+    """模拟真实中文拼音输入速度的打字延迟计算器。
 
-    Calibrated to feel like a real Chinese typist on pinyin input
-    (~5 字/秒 for a reasonably-skilled person — slower than shorthand
-    but faster than hunting-and-pecking). Typical range with
-    ``base=0.40, per_char=0.20``:
+    参数调至普通人正常聊天节奏（约 3.3 字/秒），避免机器人一下子刷屏
+    也避免慢得让人等不及。注意：URL 链接整段只算 1 个字符，防止一条
+    直播链接把延迟拉到几十秒。
 
-    +---------+---------------+
-    | 10 字   |  ~2.40s       |
-    | 20 字   |  ~4.40s       |
-    | 30 字   |  ~5.00s (cap) |
-    +---------+---------------+
+    参数 base=0.50, per_char=0.30 下的典型值（已排除 URL 计权）：
+
+    +-----------+---------------+
+    | 10 字     |  ~3.50s       |
+    | 20 字     |  ~6.50s       |
+    | 30 字     |  ~9.50s       |
+    | 40 字     | ~12.00s (cap) |
+    +-----------+---------------+
     """
 
-    base: float = 0.40
-    per_char: float = 0.20
+    base: float = 0.50
+    per_char: float = 0.30
     min_delay: float = 0.30
-    max_delay: float = 5.0
+    max_delay: float = 12.0
 
     def for_sentence(self, sentence: str) -> float:
         if not sentence:
             return 0.0
-        visible = _EMOJI_OR_MENTION_RE.sub("", sentence)
-        delay = self.base + len(visible) * self.per_char
+        # URL 整段替换为单字符占位符，按 1 个字符计权（否则一条直播链接就 50+ 字）
+        text = _URL_RE.sub("█", sentence)
+        # emoji / @mention 不计入打字长度
+        text = _EMOJI_OR_MENTION_RE.sub("", text)
+        delay = self.base + len(text) * self.per_char
         return max(self.min_delay, min(self.max_delay, delay))
 
     def for_batch(self, sentences: list[str]) -> list[float]:

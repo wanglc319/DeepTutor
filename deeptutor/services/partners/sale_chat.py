@@ -41,9 +41,9 @@ from deeptutor.services.shirley import qywx
 logger = logging.getLogger(__name__)
 
 DEBOUNCE_SECONDS = 10.0
-TYPING_BASE_DELAY = 0.40
-TYPING_PER_CHAR = 0.20
-TYPING_MAX_DELAY = 5.0
+TYPING_BASE_DELAY = 0.50
+TYPING_PER_CHAR = 0.30
+TYPING_MAX_DELAY = 12.0
 
 # 动态 soul 的 partner_id: 从 data/partners/<id>/workspace/user/workspace/SOUL.md 读取
 # 后台改完 SOUL.md 下一轮对话立即生效, 无需重启
