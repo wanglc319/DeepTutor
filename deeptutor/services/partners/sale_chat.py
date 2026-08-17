@@ -45,6 +45,16 @@ TYPING_BASE_DELAY = 0.50
 TYPING_PER_CHAR = 0.30
 TYPING_MAX_DELAY = 12.0
 
+# ── PG memory 层: 长会话策略 ──────────────────────────────────────────
+# MEMORY_WINDOW_HARD: 每次送给 LLM 推理的消息条数上限 (滑窗)
+# MEMORY_SUMMARIZE_TRIGGER: conversation.messages 累计条数 ≥ 此值时
+#   自动取前半段送 LLM 做总结 → 存入 conversation_summary
+#   下次推理时 messages = 最新 window 条 (PG) + 历史摘要 (PG)
+MEMORY_WINDOW_HARD = 10
+MEMORY_SUMMARIZE_TRIGGER = 20
+# 总结一次覆盖的条数 (从 lo_seq 开始往前推)
+MEMORY_SUMMARIZE_CHUNK = 12
+
 # 动态 soul 的 partner_id: 从 data/partners/<id>/workspace/user/workspace/SOUL.md 读取
 # 后台改完 SOUL.md 下一轮对话立即生效, 无需重启
 SOUL_PARTNER_ID = "lisa"
@@ -198,6 +208,209 @@ async def _analyze_and_save_profile(
         )
     except Exception as e:
         logger.warning("[sale_chat.analyze_and_save] failed: %s", e)
+
+
+# ── PG memory 辅助函数 ─────────────────────────────────────────────────
+
+
+async def _pg_ensure_customer_conv(
+    external_userid: str,
+    nickname: str | None = None,
+    partner_id: str = "lisa",
+) -> tuple[str, str] | None:
+    """upsert customer + upsert conversation (当天复用), 返回 (customer_id, conversation_id).
+
+    PG 挂了不阻断对话, 返回 None 让调用方跳过 PG 记忆层, 继续走 Shirley 就行.
+    """
+    try:
+        from deeptutor.sales import db as sales_db
+        cust = await sales_db.upsert_customer(
+            external_id=external_userid,
+            channel="wecom",
+            nickname=nickname,
+        )
+        customer_id = str(cust["id"])
+        conv_id = await sales_db.upsert_conversation(customer_id, partner_id=partner_id)
+        return customer_id, conv_id
+    except Exception as e:
+        logger.warning("[sale_chat.pg.memory] ensure customer/conv FAILED=%s", e)
+        return None
+
+
+async def _pg_append_message(
+    conversation_id: str,
+    sender: str,
+    content: str,
+    llm_model: str | None = None,
+    latency_ms: int | None = None,
+) -> None:
+    """往 PG messages 表写一条. 失败只 log, 不抛."""
+    try:
+        from deeptutor.sales import db as sales_db
+        await sales_db.append_message(
+            conversation_id=conversation_id,
+            sender=sender,
+            content=content,
+            llm_model=llm_model,
+            latency_ms=latency_ms,
+        )
+    except Exception as e:
+        logger.warning("[sale_chat.pg.memory] append_message(%s) FAILED=%s", sender, e)
+
+
+async def _pg_build_history_for_llm(
+    conversation_id: str,
+) -> tuple[list[dict[str, str]], str | None]:
+    """从 PG 组装 LLM 可用的 messages: 滑窗 + 历史摘要.
+
+    返回 (history_list, summary_inject_text):
+      - history_list: [{role:user/assistant, content}] 正序
+      - summary_inject_text: 若存在更早的摘要, 返回一段要注入 system prompt 的文本; None 表示没有
+    """
+    try:
+        from deeptutor.sales import db as sales_db
+
+        # 1) 先算滑窗的起点 seq
+        total = await sales_db.count_conv_messages(conversation_id)
+        lo_seq = max(1, total - MEMORY_WINDOW_HARD + 1) if total > 0 else 1
+
+        # 2) 取滑窗 (不含当前这轮 user 消息, 主流程会 append 当前消息)
+        window = await sales_db.fetch_history_window(
+            conversation_id, MEMORY_WINDOW_HARD
+        )
+
+        # 3) 取覆盖滑窗之前那段的摘要
+        summary_text = await sales_db.fetch_applicable_summary(
+            conversation_id, recent_lo_seq=lo_seq
+        )
+
+        logger.info(
+            "[sale_chat.pg.memory] conv=%s | total_msgs=%d | window_lo=%d | summary=%s",
+            conversation_id, total, lo_seq, bool(summary_text),
+        )
+        return window, summary_text
+    except Exception as e:
+        logger.warning("[sale_chat.pg.memory] build_history FAILED=%s", e)
+        return [], None
+
+
+async def _pg_maybe_trigger_summary(
+    conversation_id: str,
+    llm_model: str | None = None,
+) -> None:
+    """count_conv_messages ≥ MEMORY_SUMMARIZE_TRIGGER 时, 异步 fire-and-forget
+    一段 LLM 总结. 不阻塞主流程 —— 就算总结失败, 下次还会再触发.
+    """
+    try:
+        from deeptutor.sales import db as sales_db
+
+        total = await sales_db.count_conv_messages(conversation_id)
+        if total < MEMORY_SUMMARIZE_TRIGGER:
+            return
+
+        # 找到当前最新 summary 覆盖到哪 (没有就从 seq 1 开始)
+        pool = await sales_db.get_pool()
+        last = await pool.fetchval(
+            "SELECT COALESCE(MAX(hi_seq), 0) FROM conversation_summary "
+            "WHERE conversation_id = $1",
+            conversation_id,
+        )
+        lo_seq = int(last) + 1
+        hi_seq = min(total, lo_seq + MEMORY_SUMMARIZE_CHUNK - 1)
+        if lo_seq > hi_seq:
+            return  # 已经总结到顶了
+
+        # 拉那段原始消息
+        chunk = await sales_db.fetch_all_messages_seq_range(
+            conversation_id, lo_seq, hi_seq
+        )
+        if not chunk:
+            return
+
+        # 送 LLM 总结 (用 DeepTutor 内置 LLMClient)
+        summary, key_points = await _llm_summarize_chunk(chunk, llm_model=llm_model)
+        if not summary:
+            logger.warning("[sale_chat.pg.memory] summarize LLM returned empty")
+            return
+
+        await sales_db.save_summary(
+            conversation_id=conversation_id,
+            lo_seq=lo_seq,
+            hi_seq=hi_seq,
+            summary=summary,
+            key_points=key_points,
+            llm_model=llm_model,
+        )
+        logger.info(
+            "[sale_chat.pg.memory] summary saved | conv=%s | seq %d~%d | kp=%d",
+            conversation_id, lo_seq, hi_seq, len(key_points),
+        )
+    except Exception as e:
+        logger.warning("[sale_chat.pg.memory] trigger_summary FAILED=%s", e)
+
+
+async def _llm_summarize_chunk(
+    chunk: list[dict[str, Any]],
+    llm_model: str | None = None,
+) -> tuple[str, list[str]]:
+    """把一段 messages (dict with seq/sender/content) 送 LLM 做总结.
+
+    返回 (summary_text, key_points_list).
+    """
+    from deeptutor.services.llm import get_llm_client
+
+    # 组装对话文本
+    turns: list[str] = []
+    for m in chunk:
+        role = "客户" if m["sender"] == "customer" else "AI"
+        turns.append(f"[{role}] {m['content']}")
+    text_block = "\n".join(turns)
+
+    system_prompt = (
+        "你是 AI 销售记忆压缩工具。请把下面一段 AI 销售 (Lisa) 和客户的历史对话"
+        "压缩成 300-400 字的摘要段落 (第三人称, 保留关键事实)，"
+        "并额外列出 5 条以内的 key_points (客户明确说过的事实/偏好/顾虑)。\n"
+        "严格按以下格式输出 (不要加前后缀解释):\n"
+        "SUMMARY: ...\nKEY_POINTS:\n- ...\n- ...\n- ..."
+    )
+    prompt = f"=== 对话开始 ===\n{text_block}\n=== 对话结束 ==="
+
+    llm = get_llm_client()
+    try:
+        if hasattr(llm, "complete") and callable(getattr(llm, "complete")):
+            raw = await llm.complete(prompt=prompt, system_prompt=system_prompt)
+        else:
+            raw = ""
+    except Exception as e:
+        logger.warning("[sale_chat.pg.memory] llm summarize FAILED=%s", e)
+        return "", []
+
+    if not raw:
+        return "", []
+
+    # 解析 SUMMARY / KEY_POINTS
+    summary = ""
+    key_points: list[str] = []
+    lines = raw.strip().splitlines()
+    section = None
+    for ln in lines:
+        s = ln.strip()
+        low = s.lower()
+        if low.startswith("summary"):
+            section = "summary"
+            summary = s.split(":", 1)[1].strip() if ":" in s else ""
+            continue
+        if low.startswith("key_points") or low.startswith("key points"):
+            section = "kp"
+            continue
+        if section == "summary" and s:
+            summary += ("\n" if summary else "") + s
+        elif section == "kp":
+            if s.startswith("-") or s.startswith("*") or s.startswith("•"):
+                kp = s.lstrip("-*•").strip()
+                if kp:
+                    key_points.append(kp)
+    return summary.strip(), key_points
 
 
 import re as _re_mod
@@ -604,6 +817,10 @@ async def _process_session_core(
         logger.debug("[sale_chat.process] session=%s | aggregated_text=%s", session_id, aggregated_text[:300])
 
     try:
+        # ── PG memory 层: 确保 customer + conversation 存在 ──────────
+        pg_conv_pair = await _pg_ensure_customer_conv(external_userid)
+        pg_conv_id = pg_conv_pair[1] if pg_conv_pair else None
+
         # ⓪ 图片消息 (msgType=101): 多模态识别图片内容 → 描述注入, 供 KB 匹配 + LLM 回答
         image_urls = _collect_image_urls(messages)
         image_desc = ""
@@ -633,6 +850,22 @@ async def _process_session_core(
             session_id, int((time.perf_counter() - t_fetch) * 1000),
             len(history), len(kb_context), kb_score,
         )
+
+        # ── PG memory 层: user 消息进 PG + 合成 history ────────────
+        history_summary_inject: str | None = None
+        if pg_conv_id:
+            await _pg_append_message(pg_conv_id, "customer", aggregated_text)
+            pg_window, history_summary_inject = await _pg_build_history_for_llm(
+                pg_conv_id
+            )
+            # PG 有数据 → 用 PG 滑窗替换 Shirley history (PG 按 seq 更稳定);
+            # PG 还没数据 (第一次对话) → 保留 Shirley history 作为初始上下文
+            if pg_window:
+                history = pg_window
+                logger.info(
+                    "[sale_chat.pg.memory] using PG window turns=%d | summary=%s",
+                    len(pg_window), bool(history_summary_inject),
+                )
 
         # 是否需要知识库支撑: 问题命中产品/课程类关键词才算"需要 KB 回答"。
         # 图片消息用 KB 做增强(匹配上就用), 但不作为降级闸门 ——
@@ -705,6 +938,9 @@ async def _process_session_core(
             trace_outcome.reply = _format_reject_answer(
                 refusal_reason or "用户明确拒绝", aggregated_text[:200]
             )
+            # ── PG memory: 拒绝回复也进 PG ──────────────────────────────
+            if pg_conv_id:
+                await _pg_append_message(pg_conv_id, "ai", trace_outcome.reply)
             t0 = time.perf_counter()
 
             # 4.1 打「勿扰」企微标签
@@ -788,6 +1024,9 @@ async def _process_session_core(
         if kb_degraded:
             trace_outcome.transferred = True
             trace_outcome.reply = _format_reject_answer(degrade_reason, raw_text[:200])
+            # ── PG memory: KB 降级拒绝回复也进 PG ────────────────────────
+            if pg_conv_id:
+                await _pg_append_message(pg_conv_id, "ai", trace_outcome.reply)
             logger.warning(
                 "[sale_chat.kb_degrade] session=%s | kb_required=%s | kb_score=%.4f | threshold=%.2f | → 转人工",
                 session_id, kb_required, kb_score, _KB_CONFIDENCE_THRESHOLD,
@@ -821,6 +1060,7 @@ async def _process_session_core(
             prime_info=prime_info,
             profile_summary=profile_summary,
             kb_context=kb_context,
+            history_summary_inject=history_summary_inject,
         )
 
         # ⑤.5 兜底: LLM 流式完全没出字 → 推兜底话术
@@ -883,6 +1123,15 @@ async def _process_session_core(
                 logger.warning("[sale_chat.live_request] session=%s | MCP returned no live url, marker removed", session_id)
 
         trace_outcome.reply = final_reply.strip()
+
+        # ── PG memory 层: AI 回复进 PG + 触发自动总结 ───────────────
+        if pg_conv_id and final_reply.strip():
+            await _pg_append_message(
+                pg_conv_id, "ai", final_reply.strip(),
+                llm_model=getattr(get_llm_client(), "model", None),
+            )
+            # fire-and-forget: 不阻塞主流程
+            asyncio.create_task(_pg_maybe_trigger_summary(pg_conv_id))
 
         # ⑧ Shirley 5.3: 把本轮 sales 判定的 intent_level + 画像分析写回
         await _analyze_and_save_profile(
@@ -1023,11 +1272,15 @@ async def _stream_llm_and_push(
     prime_info: dict[str, Any],
     profile_summary: str = "",
     kb_context: str = "",
+    history_summary_inject: str | None = None,
 ) -> str:
     """流式调 LLM, 边收 chunk 边检测完整句子, 立即推送.
 
     返回累积的完整文本 (用于后续 action_text 追加和 [LIVE_LINK] 标记处理).
     首句在流式过程中就已推到家长微信, 不再等完整生成.
+
+    history_summary_inject: 可选的长会话摘要, 有值时拼进 system prompt,
+        作为滑窗之外更久远历史的压缩记忆.
     """
     t0 = time.perf_counter()
     from deeptutor.observability.agent_monitor import mark_mcp_failed
@@ -1038,6 +1291,9 @@ async def _stream_llm_and_push(
     cfg = llm.config
 
     system_prompt = _build_system_prompt(profile_summary, kb_context=kb_context)
+    # 长会话摘要注入: 追加到 system prompt 最前面 (让 LLM 先看到宏观背景)
+    if history_summary_inject:
+        system_prompt = f"{history_summary_inject}\n\n---\n\n{system_prompt}"
 
     clean_history: list[dict[str, str]] = []
     for h in history:
