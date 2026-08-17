@@ -1087,6 +1087,24 @@ async def _process_session_core(
             except Exception as fb_err:
                 logger.warning("[sale_chat.fallback_push] session=%s | FAILED=%s", session_id, fb_err)
 
+            # ⑤.6 补偿链路 (fire-and-forget): 延迟重试一次 LLM,
+            #     重试成功 → 推送真实回复; 仍失败 → 推 msgType=119 转人工,
+            #     保证"稍等一下"之后一定还有后续 (不再让客户干等).
+            asyncio.create_task(
+                _fallback_retry_and_escalate(
+                    session_id=session_id,
+                    history=history,
+                    aggregated=aggregated_text,
+                    corpid=corpid,
+                    external_userid=external_userid,
+                    prime_info=prime_info,
+                    profile_summary=profile_summary,
+                    kb_context=kb_context,
+                    history_summary_inject=history_summary_inject,
+                    pg_conv_id=pg_conv_id,
+                )
+            )
+
         # ⑥ 追加 sales service 的 action_text (直播链接等), 流式结束后再追加推
         if action_text:
             final_reply += action_text
@@ -1160,6 +1178,9 @@ async def _process_session_core(
 
 # LLM 异常时的兜底话术，保证 reply_lisa_message 一定被调用（核心指标）
 _FALLBACK_REPLY = "稍等一下哦，我这边看看～"
+
+# 兜底触发后的补偿重试延迟 (秒): 等网关瞬时故障恢复 + 模拟真人查看耗时
+_FALLBACK_RETRY_DELAY = float(os.getenv("SALE_CHAT_FALLBACK_RETRY_DELAY", "15.0"))
 
 # msgType=101 表示客户发的是图片消息（content 为图片 URL）
 _MSG_TYPE_IMAGE = 101
@@ -1749,3 +1770,72 @@ async def _push_reject(
     except Exception as e:
         mark_mcp_failed()
         logger.warning("[sale_chat.push_reject] FAIL | elapsed_ms=%d | err=%s", int((time.perf_counter() - t0) * 1000), e)
+
+
+async def _fallback_retry_and_escalate(
+    *,
+    session_id: str,
+    history: list[dict[str, str]],
+    aggregated: str,
+    corpid: str,
+    external_userid: str,
+    prime_info: dict[str, Any],
+    profile_summary: str = "",
+    kb_context: str = "",
+    history_summary_inject: str | None = None,
+    pg_conv_id: str | None = None,
+) -> None:
+    """兜底话术推完后的补偿链路: 延迟重试 → 仍失败则转人工 (119).
+
+    fire-and-forget, 不阻塞主流程:
+      1. 延迟 _FALLBACK_RETRY_DELAY 秒 (避开网关瞬时故障, 顺便像真人查资料)
+      2. 重新走流式 LLM 生成 (复用主链路全部上下文)
+      3. 成功 → 真实回复逐句推给客户 + PG 落库
+      4. 仍失败 → 推 msgType=119 转人工, 保证有人接手, 不再让客户干等
+    """
+    await asyncio.sleep(_FALLBACK_RETRY_DELAY)
+    t0 = time.perf_counter()
+    try:
+        retry_reply = (await _stream_llm_and_push(
+            history=history,
+            aggregated=aggregated,
+            corpid=corpid,
+            external_userid=external_userid,
+            prime_info=prime_info,
+            profile_summary=profile_summary,
+            kb_context=kb_context,
+            history_summary_inject=history_summary_inject,
+        )).strip()
+    except Exception as retry_err:
+        logger.warning(
+            "[sale_chat.fallback_retry] session=%s | llm retry FAILED=%s",
+            session_id, retry_err,
+        )
+        retry_reply = ""
+
+    if retry_reply:
+        logger.info(
+            "[sale_chat.fallback_retry] session=%s | SUCCESS | elapsed_ms=%d | chars=%d",
+            session_id, int((time.perf_counter() - t0) * 1000), len(retry_reply),
+        )
+        if pg_conv_id:
+            await _pg_append_message(pg_conv_id, "ai", retry_reply)
+        return
+
+    # 重试仍失败 → 转人工, 复用 119 链路
+    logger.warning(
+        "[sale_chat.fallback_retry] session=%s | retry still empty after %dms, escalate to human",
+        session_id, int((time.perf_counter() - t0) * 1000),
+    )
+    try:
+        await _push_reject(
+            corpid=corpid,
+            external_userid=external_userid,
+            prime_info=prime_info,
+            reason="AI 连续两次生成回复失败，已自动转人工处理",
+            user_original=aggregated[:200],
+        )
+    except Exception as esc_err:
+        logger.warning(
+            "[sale_chat.fallback_retry] session=%s | escalate FAILED=%s", session_id, esc_err,
+        )
