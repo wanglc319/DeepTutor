@@ -1,9 +1,32 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime
+
+import pytest
 
 from deeptutor.services.shirley import live
 from deeptutor.services.shirley.resolver import ResolvedIDs
+
+
+def test_weekday_label_keeps_today_after_start_time() -> None:
+    label = live._weekday_label(
+        0,
+        "2026-08-18 19:00:00",
+        now=datetime(2026, 8, 18, 20, 0, 0),
+    )
+
+    assert label == "本周二"
+
+
+def test_weekday_label_rejects_date_before_today() -> None:
+    label = live._weekday_label(
+        0,
+        "2026-08-17 23:59:59",
+        now=datetime(2026, 8, 18, 0, 0, 0),
+    )
+
+    assert label == ""
 
 
 def test_list_weekly_lives_accepts_and_uses_fallback_identity_fields(monkeypatch) -> None:

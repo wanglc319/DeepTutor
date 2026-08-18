@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 import logging
+import math
 import os
 import re
 import time
@@ -368,13 +369,129 @@ async def _llm_summarize_chunk(
         turns.append(f"[{role}] {m['content']}")
     text_block = "\n".join(turns)
 
-    system_prompt = (
-        "你是 AI 销售记忆压缩工具。请把下面一段 AI 销售 (Lisa) 和客户的历史对话"
-        "压缩成 300-400 字的摘要段落 (第三人称, 保留关键事实)，"
-        "并额外列出 5 条以内的 key_points (客户明确说过的事实/偏好/顾虑)。\n"
-        "严格按以下格式输出 (不要加前后缀解释):\n"
-        "SUMMARY: ...\nKEY_POINTS:\n- ...\n- ...\n- ..."
-    )
+    system_prompt = """
+你是“AI 销售对话记忆压缩工具”。
+
+你的任务是把 Lisa 与客户的当前对话压缩为客观、准确、可供后续程序继续提取用户画像的对话摘要和事实要点。
+
+你只负责压缩与保留事实，不负责生成画像字段，不负责销售判断，不提供建议，不推测客户情况。
+
+【一、SUMMARY 规则】
+
+1. 使用第三人称，客观概括本段对话，不超过 400 个汉字。
+2. 信息较少时允许写得更短，禁止为了凑字数重复内容、补充常识或进行推测。
+3. 优先保留客户的学习现状、学习经历、明确问题、家庭条件、购买顾虑以及对话当前进展。
+4. 准确保留人物主体、时间、否定词和状态差异。
+5. 不得把“计划学习”写成“正在学习”，不得把“购买过”写成“已经学过”。
+6. 不得加入“家校配合度高”“学习潜力大”“有望进一步拔高”“购买意愿较强”等没有客户原话支持的评价。
+7. 可以描述 Lisa 询问了什么，但 Lisa 的问题、建议、推荐和推测不能写成客户事实。
+
+【二、KEY_POINTS 规则】
+
+1. KEY_POINTS 只记录客户明确表达或明确确认过的事实、经历、偏好、顾虑和问题。
+2. 每条尽量只表达一个事实；同一类别的书籍、课程、App、教材或考试经历可以合并为一条完整清单。
+3. 不固定为 5 条，通常输出 1—12 条；事实较多时应压缩措辞，不得因为条数限制删除明确的重要事实。
+4. 多个产品、教材或考试名称必须全部保留、去重，不能只保留最后出现的一个。
+5. 不重复 SUMMARY 中的修饰性表达，只保留后续程序可以直接使用的事实。
+6. 若本段没有新增的可确认事实，输出“- 无”。
+
+【三、外部学习与考试经历】
+
+需要重点保留客户明确提到的以下经历：
+
+- 当前正在使用的外部教材、书籍、课程、学习工具或 App；
+- 以前使用、学习或参加过的外部教材、课程、培训班或学习产品；
+- 参加、备考、通过或取得成绩的英语考试，例如 IELTS、TOEFL、KET、PET、FCE、剑桥少儿英语等；
+- 与上述经历相关的学习时间、使用状态、学习效果、考试时间和成绩。
+
+必须准确区分以下状态：
+
+- “正在使用／正在学习”
+- “曾经使用／以前学过”
+- “只购买但未开始学习”
+- “计划购买／计划学习”
+- “正在备考”
+- “参加过考试”
+- “通过考试／取得证书”
+- “具体考试分数或等级”
+
+例如，客户明确表达后，可以记录为：
+
+- 客户当前正在使用 RAZ、牛津树和新概念英语第一册。
+- 客户以前学过斑马英语，目前已经停学。
+- 客户参加过 KET 并已通过，曾参加 IELTS，成绩为 6.0 分。
+
+不能把不同状态混写成“都学过”。
+
+Lisa 或销售方推荐的产品，不代表客户购买或学习过。只有客户明确表示自己已经购买、使用或学习，才可记录为客户经历。
+
+【四、痛点识别规则】
+
+只有客户明确表达以下内容时，才可记录为痛点：
+
+- 学习困难或薄弱项；
+- 孩子的负面表现或具体问题；
+- 家长明确担忧、困惑或不满意的情况；
+- 已经造成影响的学习障碍。
+
+不得根据成绩、年级、教材封面、图片排版、产品宣传语或一般常识自行推断痛点。
+
+以下内容不能单独作为痛点：
+
+- “如图”“这个”“上面那个”等指代词；
+- 图片中的标题、目录、课程卖点或宣传文案；
+- Lisa 提问时列举的问题；
+- AI 对图片的主观解释；
+- “可能、应该、看起来、预计”等推测性内容。
+
+如果客户明确表示“没有薄弱项”“目前不吃力”，应如实保留，不得为了生成痛点而反向推测问题。
+
+【五、图片与 OCR 规则】
+
+1. 图片 OCR 文字是“图片内容”，不等于客户亲口陈述。
+2. 不得把图片中的宣传语、课程卖点、目录文字或密集文字提取为客户痛点。
+3. 不得仅凭产品封面判断客户已经购买、正在学习或学习效果如何。
+4. 只有客户同时明确表示“这是正在用的”“这些都学过”“我买了这些”等，才可把图片中能够确认的名称记录为相应学习经历。
+5. 客户只说“如图”但无法从上下文确认含义时，不得把“如图”写入 SUMMARY 或 KEY_POINTS。
+6. 图片无法可靠识别时应忽略，不得猜测。
+7. 如果客户明确评价图片中的材料，例如“这套书字太多，孩子不愿意看”，可以记录该评价和痛点，但不能把 OCR 文字本身当作痛点。
+
+【六、事实归属与冲突处理】
+
+1. 只把客户本人说过或明确确认过的内容作为客户事实。
+2. 客户回复“是的、对、没错”等简短确认时，可以结合 Lisa 紧邻的上一句问题确定事实。
+3. 不得把 Lisa 的提问、复述、推荐或假设直接作为客户事实。
+4. 多孩家庭必须区分不同孩子，不能把兄弟姐妹的年级、成绩和学习经历混到目标孩子身上。
+5. 同一事实出现冲突时，以客户最新、最明确的说法为准，并保留必要的变化信息。
+6. “不知道、记不清、可能、大概”等内容必须保留其不确定性，不得改写成确定事实。
+7. 客户明确纠正或否认旧信息时，应采用纠正后的信息。
+
+【七、优先保留的信息范围】
+
+在对话中出现时，应优先保留：
+
+- 孩子称呼、年龄、年级和升学时间；
+- 当前英语水平、成绩和能力表现；
+- 客户明确表达的薄弱项、困难和担忧；
+- 所在地区、校内教材版本和校内英语起点；
+- 外部教材、书籍、课程、App 和机构经历；
+- IELTS、KET、PET 等备考、考试、通过和成绩经历；
+- 每日或每周可投入的学习时间；
+- 家长的陪学、辅导和纠音能力；
+- 多孩情况及不同孩子的信息；
+- 预算、价格顾虑、优惠关注点；
+- 家庭购买决策人和需要商量的对象。
+
+【八、严格输出格式】
+
+只能按照以下格式输出，不添加标题、解释、代码块或其他前后缀：
+
+SUMMARY: <一段客观摘要>
+KEY_POINTS:
+- <客户明确事实>
+- <客户明确事实>
+- <客户明确事实>
+"""
     prompt = f"=== 对话开始 ===\n{text_block}\n=== 对话结束 ==="
 
     llm = get_llm_client()
@@ -467,6 +584,37 @@ async def _fetch_live_link_direct(prime_info: dict[str, Any], external_userid: s
         return None
 
 
+def _build_kb_query(aggregated_text: str, image_desc: str) -> str:
+    text = aggregated_text.strip()
+    description = image_desc.strip()
+    if not description or description in text:
+        return text
+    image_context = f"[客户图片内容识别] {description}"
+    return f"{text}\n{image_context}" if text else image_context
+
+
+def _normalize_kb_score(value: Any) -> float:
+    if isinstance(value, bool):
+        return 0.0
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return score if math.isfinite(score) else 0.0
+
+
+def _merge_kb_snippets(snippets: list[tuple[str, str]]) -> str:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for kb_name, content in snippets:
+        normalized = " ".join(content.split())
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        merged.append(f"【{kb_name}】{content[:1200]}")
+    return "\n\n".join(merged)[:3000]
+
+
 async def _fetch_kb_context(query: str, partner_id: str = SOUL_PARTNER_ID) -> tuple[str, float]:
     """走 qdrant 知识库检索, 把相关话术/知识片段压缩后注入 system prompt.
 
@@ -504,8 +652,8 @@ async def _fetch_kb_context(query: str, partner_id: str = SOUL_PARTNER_ID) -> tu
             return "", 0.0
 
         svc = RAGService(kb_base_dir=str(kb_root))
-        snippets: list[str] = []
-        max_score: float = 0.0
+        snippets: list[tuple[str, str]] = []
+        max_score = 0.0
         for kb in kb_names[:3]:
             try:
                 t0 = time.perf_counter()
@@ -515,22 +663,22 @@ async def _fetch_kb_context(query: str, partner_id: str = SOUL_PARTNER_ID) -> tu
                 sources = res.get("sources") or []
                 for src in sources:
                     if isinstance(src, dict):
-                        sc = src.get("score")
-                        if isinstance(sc, (int, float)) and sc > max_score:
-                            max_score = float(sc)
+                        max_score = max(
+                            max_score,
+                            _normalize_kb_score(src.get("score")),
+                        )
                 logger.info(
                     "[sale_chat.kb ←✓] kb=%s | elapsed_ms=%d | content_chars=%d | max_score=%.4f",
                     kb, int((time.perf_counter() - t0) * 1000), len(content), max_score,
                 )
                 if content:
-                    # 清除知识库中的历史过期直播链接
                     content = _strip_live_links(content)
-                    snippets.append(f"【{kb}】{content[:1200]}")
+                    snippets.append((kb, content))
             except Exception as e:
                 logger.warning("[sale_chat.kb ←✗] kb=%s | FAILED=%s", kb, e)
         if not snippets:
             return "", max_score
-        return "\n\n".join(snippets)[:3000], max_score
+        return _merge_kb_snippets(snippets), max_score
     except Exception as e:
         logger.warning("[sale_chat.kb] retrieval failed, degrade to empty: %s", e)
         return "", 0.0
@@ -695,11 +843,26 @@ async def _describe_images(image_urls: list[str]) -> str:
         return ""
 
 
+def _kb_guardrail_decision(
+    kb_required: bool,
+    kb_context: str,
+    kb_score: float,
+    threshold: float,
+) -> str:
+    if not kb_required:
+        return "skip"
+    if not kb_context or kb_score < threshold:
+        return "transfer"
+    if kb_score < threshold + 0.10:
+        return "judge"
+    return "pass"
+
+
 async def _kb_can_answer(question: str, kb_context: str) -> bool:
     """用 LLM 判断知识库召回内容能否回答用户问题（降级转人工的闸门）。
 
     纯向量 score 阈值区分度不够（域内 0.65-0.81 vs 无关 0.61-0.65 间隙太窄），
-    所以用 LLM 做最终相关性判定。LLM 失败时放行（不误伤正常对话）。
+    所以用 LLM 做最终相关性判定。LLM 失败时拒绝放行。
     """
     if not (question or "").strip() or not (kb_context or "").strip():
         return False
@@ -721,8 +884,8 @@ async def _kb_can_answer(question: str, kb_context: str) -> bool:
         )
         return can
     except Exception as e:
-        logger.warning("[sale_chat.kb_judge ←✗] FAILED=%s, 放行不误伤", e)
-        return True
+        logger.warning("[sale_chat.kb_judge ←✗] FAILED=%s, 拒绝放行", e)
+        return False
 
 
 @dataclass
@@ -838,7 +1001,7 @@ async def _process_session_core(
             pg_cust_row, pg_conv_id = pg_pair
 
         # ①②②.5 Shirley 画像+历史+QDrant + PG history 合成四者互不依赖, gather 并行
-        kb_query = image_desc if image_desc else aggregated_text
+        kb_query = _build_kb_query(aggregated_text, image_desc)
         t_fetch = time.perf_counter()
         (
             profile_summary,
@@ -1008,24 +1171,37 @@ async def _process_session_core(
         #     图片消息识别后 KB 匹配不上, 或产品/课程类问题 KB 召回弱, 都走人工
         #     三段判定: score < 阈值 → 直接转人工; score >= 阈值+0.10 → 放行;
         #     中间模糊区 → LLM 判定召回内容能否回答问题
-        kb_degraded = False
+        kb_gate = _kb_guardrail_decision(
+            kb_required,
+            kb_context,
+            kb_score,
+            _KB_CONFIDENCE_THRESHOLD,
+        )
+        kb_degraded = kb_gate == "transfer"
         degrade_reason = ""
-        if kb_required:
-            if not kb_context or kb_score < _KB_CONFIDENCE_THRESHOLD:
-                kb_degraded = True
+        if kb_degraded:
+            degrade_reason = (
+                f"知识库无法有效回答该问题（置信度 {kb_score:.2f} < 阈值 {_KB_CONFIDENCE_THRESHOLD}），"
+                f"已降级转人工处理。用户问题摘要：{raw_text[:80]}"
+            )
+        elif kb_gate == "judge":
+            can_answer = await _kb_can_answer(kb_query, kb_context)
+            kb_gate = "pass" if can_answer else "transfer"
+            kb_degraded = not can_answer
+            if kb_degraded:
                 degrade_reason = (
-                    f"知识库无法有效回答该问题（置信度 {kb_score:.2f} < 阈值 {_KB_CONFIDENCE_THRESHOLD}），"
-                    f"已降级转人工处理。用户问题摘要：{raw_text[:80]}"
+                    f"知识库召回内容与用户问题不匹配（置信度 {kb_score:.2f}），"
+                    f"AI 判定无法回答，已降级转人工处理。用户问题摘要：{raw_text[:80]}"
                 )
-            elif kb_score < _KB_CONFIDENCE_THRESHOLD + 0.10:
-                # 模糊区: LLM 判定召回内容能否回答
-                can_answer = await _kb_can_answer(kb_query, kb_context)
-                if not can_answer:
-                    kb_degraded = True
-                    degrade_reason = (
-                        f"知识库召回内容与用户问题不匹配（置信度 {kb_score:.2f}），"
-                        f"AI 判定无法回答，已降级转人工处理。用户问题摘要：{raw_text[:80]}"
-                    )
+        logger.info(
+            "[sale_chat.kb_gate] session=%s | required=%s | decision=%s | score=%.4f | threshold=%.4f | has_context=%s",
+            session_id,
+            kb_required,
+            kb_gate,
+            kb_score,
+            _KB_CONFIDENCE_THRESHOLD,
+            bool(kb_context),
+        )
         if kb_degraded:
             trace_outcome.transferred = True
             trace_outcome.reply = _format_reject_answer(degrade_reason, raw_text[:200])
@@ -1226,6 +1402,8 @@ _NO_TOOL_RULE = """
 - 禁止输出 JSON、大括号 {}、``` 代码块
 - 禁止输出 key="value" 这种参数写法
 - 只输出你要发给家长的纯中文口语句子，别的一个字都不要加
+- 不要使用「」包裹普通回复、课程名或用户原话
+- 用户画像和历史消息中已经明确的信息必须直接使用，不得重复询问；只有字段缺失、冲突或无法确认时才追问
 
 **唯一例外：直播链接 [LIVE_LINK]**
 只有当家长**明确表达了想看直播/试听课/回放的意愿**时，你才在回复末尾加上 [LIVE_LINK] 标记（独占一行）。系统会自动替换成最新的有效直播链接。
@@ -1612,6 +1790,7 @@ def _strip_tool_calls(text: str) -> str:
 
     # 残留的转义引号 / 孤立括号
     cleaned = re.sub(r'\\+"', '"', cleaned)
+    cleaned = cleaned.replace("「", "").replace("」", "")
     cleaned = re.sub(r"^[\s{}\[\](),]+|[\s{}\[\](),]+$", "", cleaned)
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
     return re.sub(r"\n{3,}", "\n\n", cleaned).strip()

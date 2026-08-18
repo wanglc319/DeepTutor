@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from typing import Any
 
@@ -54,10 +55,10 @@ RELATIONSHIP_KEY = "relationship"
 _ATTR_LENGTH_LIMITS: dict[str, int] = {
     "child_name":          10,
     "grade":               15,
-    "pain_points":         50,
+    "pain_points":         100,
     "level_self_report":   25,
     "region_textbook":     15,
-    "owned_products":      50,
+    "owned_products":      300,
     "school_english_start":25,
     "external_classes":    25,
     "available_time":      25,
@@ -77,6 +78,24 @@ def _truncate_str(s: Any, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:max(0, limit - 1)] + "…"
+
+
+def _merge_incremental_field(old_value: Any, new_value: Any, limit: int) -> str:
+    items: list[str] = []
+    seen: set[str] = set()
+    for value in (old_value, new_value):
+        for item in re.split(r"[、,，;；\n]+", str(value or "")):
+            normalized = item.strip()
+            if (
+                normalized
+                and normalized != "未提取到"
+                and normalized not in seen
+            ):
+                seen.add(normalized)
+                items.append(normalized)
+    while items and len("、".join(items)) > limit:
+        items.pop(0)
+    return "、".join(items)
 
 
 def _truncate_attr(attr: dict[str, Any]) -> dict[str, Any]:
@@ -334,8 +353,18 @@ def merge_into_attributes(
         key = attr["key"]
         extracted_val = extracted.get(key, "")
         if extracted_val:
-            raw_values = [extracted_val] if isinstance(extracted_val, str) else list(extracted_val)
-            raw_summary = extracted_val if isinstance(extracted_val, str) else ", ".join(extracted_val)
+            if key in {"owned_products", "pain_points"}:
+                old_value = attr.get("summary") or "、".join(attr.get("values") or [])
+                merged_value = _merge_incremental_field(
+                    old_value,
+                    extracted_val,
+                    _ATTR_LENGTH_LIMITS[key],
+                )
+                raw_values = [merged_value]
+                raw_summary = merged_value
+            else:
+                raw_values = [extracted_val] if isinstance(extracted_val, str) else list(extracted_val)
+                raw_summary = extracted_val if isinstance(extracted_val, str) else ", ".join(extracted_val)
             attr = {
                 **attr,
                 "values": raw_values,

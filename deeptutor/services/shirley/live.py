@@ -209,14 +209,18 @@ def _time_to_ts(val: Any) -> int | None:
     return None
 
 
-def _weekday_label(start_timestamp: int | None, start_time: str) -> str:
+def _weekday_label(
+    start_timestamp: int | None,
+    start_time: str,
+    *,
+    now: Any = None,
+) -> str:
     """根据开始时间生成 '本周X' 或 '下周X' 标签。
 
-    以自然周（周一为周首）计算，过期场次返回空串。
+    以自然周（周一为周首）计算，日期早于今天的场次返回空串。
     """
     from datetime import datetime, timedelta
 
-    # 解析目标日期
     target: datetime | None = None
     if start_timestamp:
         try:
@@ -233,9 +237,8 @@ def _weekday_label(start_timestamp: int | None, start_time: str) -> str:
     if target is None:
         return ""
 
-    now = datetime.now()
-    # 过期判定: 已过开始时间的不发
-    if target < now:
+    current = now or datetime.now()
+    if target.date() < current.date():
         return ""
 
     weekday_names = ["一", "二", "三", "四", "五", "六", "日"]
@@ -243,7 +246,7 @@ def _weekday_label(start_timestamp: int | None, start_time: str) -> str:
 
     # 自然周: 周一为起点
     target_monday = target.date() - timedelta(days=target_wd)
-    now_monday = now.date() - timedelta(days=now.weekday())
+    now_monday = current.date() - timedelta(days=current.weekday())
     week_diff = (target_monday - now_monday).days // 7
 
     if week_diff == 0:
@@ -257,7 +260,7 @@ def _weekday_label(start_timestamp: int | None, start_time: str) -> str:
 def format_live_lines(sessions: list[LiveSession]) -> str:
     """把多场直播拼成推送文案行: 每场一行 "name（本周X）：链接"。
 
-    过期场次（beginTime < now）自动过滤，不会发给用户。
+    日期早于今天的场次自动过滤，不会发给用户。
     """
     lines: list[str] = []
     for s in sessions:
